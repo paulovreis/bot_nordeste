@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from .util import hamming64
+
+log = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -153,7 +156,9 @@ def find_story_duplicate(
                 break
 
     if best_id is not None and best_d <= int(hamming_max):
+        log.debug("dedup_match_found", extra={"match_id": best_id, "hamming": best_d, "candidates": len(rows)})
         return best_id, int(best_d)
+    log.debug("dedup_no_match", extra={"candidates": len(rows), "best_hamming": best_d if best_id else None})
     return None
 
 
@@ -169,6 +174,26 @@ def reset_stale_sending(conn: sqlite3.Connection, *, older_than_minutes: int = 6
         (cutoff,),
     )
     return int(cur.rowcount or 0)
+
+
+def purge_older_than_days(conn: sqlite3.Connection, *, older_than_days: int = 30) -> tuple[int, int]:
+    """Delete rows older than a retention window.
+
+    Uses `news.published_at` (UTC ISO string) as the cutoff. Deletes queue rows first
+    to satisfy FK constraints, then deletes news rows.
+    """
+    days = max(1, int(older_than_days))
+    cutoff = (_utc_now() - timedelta(days=days)).isoformat(timespec="seconds")
+    with transaction(conn):
+        qcur = conn.execute(
+            "DELETE FROM queue WHERE news_id IN (SELECT news_id FROM news WHERE published_at < ?)",
+            (cutoff,),
+        )
+        ncur = conn.execute(
+            "DELETE FROM news WHERE published_at < ?",
+            (cutoff,),
+        )
+    return int(qcur.rowcount or 0), int(ncur.rowcount or 0)
 
 
 @contextmanager
@@ -216,8 +241,10 @@ def upsert_news_and_enqueue(
     b3 = int(band3 or 0)
     b4 = int(band4 or 0)
 
-    # Story-level dedup (cross-portal) within a rolling window.
-    cutoff = (_utc_now() - timedelta(hours=int(dedup_window_hours))).isoformat(timespec="seconds")
+    # Story-level dedup: look back from the article's own publication date so that
+    # late-collected items are still compared against articles from the same event window.
+    pub_utc = published_at.astimezone(timezone.utc)
+    cutoff = (pub_utc - timedelta(hours=int(dedup_window_hours))).isoformat(timespec="seconds")
     dup = None
     if sh_u64 and (b1 or b2 or b3 or b4):
         dup = find_story_duplicate(
@@ -234,6 +261,10 @@ def upsert_news_and_enqueue(
         dedup_status = "dup"
         dedup_of, dist = dup
         dedup_reason = f"simhash_hamming:{dist}"
+        log.info(
+            "story_dedup",
+            extra={"news_id": news_id, "dup_of": dedup_of, "hamming": dist, "title": title[:80]},
+        )
 
     with transaction(conn):
         cur = conn.execute(

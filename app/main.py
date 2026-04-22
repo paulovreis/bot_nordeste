@@ -87,6 +87,13 @@ async def collector_loop(conn, settings) -> None:
                 "collector_done",
                 extra={"total": total, "inserted_or_queued": inserted, "blocked_adult": blocked},
             )
+
+            try:
+                qdel, ndel = db.purge_older_than_days(conn, older_than_days=settings.retention_days)
+                if qdel or ndel:
+                    log.info("retention_purge", extra={"queue_deleted": qdel, "news_deleted": ndel})
+            except Exception:
+                log.debug("retention_purge_failed")
         except Exception:
             log.exception("collector_error")
 
@@ -97,8 +104,18 @@ async def sender_loop(conn, settings) -> None:
     tz = ZoneInfo(settings.timezone)
     window = SendWindow(tz=tz, start=parse_hhmm(settings.send_window_start), end=parse_hhmm(settings.send_window_end))
 
-    timeout = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
-    headers = {"User-Agent": "bot_nordeste/1.0"}
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=5.0, pool=5.0)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+    }
 
     async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         tg = TelegramClient(settings.bot_token, client)
@@ -142,6 +159,8 @@ async def sender_loop(conn, settings) -> None:
                 telegraph_url = row["telegraph_url"]
                 safety_status = row["safety_status"]
 
+                allow_claude_fallback = False
+
                 # Hard block: never send non-news sources.
                 if is_blocked_source_url(url):
                     db.mark_skipped(conn, queue_id, "blocked_source_url")
@@ -150,6 +169,8 @@ async def sender_loop(conn, settings) -> None:
                 # Enrich on-demand (one HTTP request per sent item)
                 if not image_url or not og_desc or is_homepage_url(url) or domain_from_url(url) == "news.google.com":
                     og = await fetch_og(client, url)
+                    # Fallback only when page couldn't be fetched or returned no usable image.
+                    allow_claude_fallback = not bool(getattr(og, "parsed_html", False)) or not bool(og.image_url)
 
                     # If the final URL after redirects is bad, don't send.
                     if og.final_url and (is_homepage_url(og.final_url) or is_blocked_source_url(og.final_url)):
@@ -182,8 +203,14 @@ async def sender_loop(conn, settings) -> None:
                         image_url = image_url or og.image_url
                         og_desc = og_desc or og.description
 
-                # If we still don't have an image, try fallback chain.
-                if not image_url and settings.image_fallback:
+                # If we still don't have an image, try fallback chain — but only
+                # when the article page had no <img> tags or couldn't be fetched.
+                if not image_url and settings.image_fallback and allow_claude_fallback:
+                    _fallback_reason = "fetch_error" if not getattr(og, "parsed_html", False) else "no_img_tags"
+                    log.info(
+                        "image_fallback_start",
+                        extra={"news_id": news_id, "url": url, "reason": _fallback_reason},
+                    )
                     fb = await get_fallback_image(
                         client,
                         title,
@@ -191,6 +218,7 @@ async def sender_loop(conn, settings) -> None:
                         claude_model=settings.claude_model,
                     )
                     if fb:
+                        log.info("image_fallback_used", extra={"news_id": news_id, "url": fb})
                         db.set_enrichment(conn, news_id, image_url=fb, og_description=None)
                         image_url = fb
 
@@ -228,21 +256,26 @@ async def sender_loop(conn, settings) -> None:
                 published_local = datetime.fromisoformat(row["published_at"]).astimezone(tz)
                 source_display = normalize_text(row["source"] or "")
                 domain = domain_from_url(url)
+                dom = (domain or "").strip().lower()
+                if dom.endswith("google.com"):
+                    domain = ""
+                if source_display and "news.google.com" in source_display.lower():
+                    source_display = ""
                 if domain and (not source_display or source_display == "google-news"):
                     source_display = domain
                 elif domain and source_display and domain not in source_display.lower():
                     # Keep source concise and informative
                     source_display = domain
+                if source_display.strip().lower() == "news.google.com":
+                    source_display = ""
 
-                summary = normalize_text(snippet) or normalize_text(og_desc or "")
-                summary = truncate(summary, 260)
-
-                # Similar to the example: title, source line, then a short summary.
-                text = (
-                    f"<b>{_escape(normalize_text(title))}</b>\n"
-                    f"<i>{_escape(source_display)}</i> — <i>{published_local.strftime('%d/%m/%Y %H:%M')}</i>\n\n"
-                    f"{_escape(summary)}"
-                ).strip()
+                dt = published_local.strftime("%d/%m/%Y %H:%M")
+                title_line = f"📰 <b>{_escape(normalize_text(title))}</b>"
+                if source_display:
+                    info_line = f"🌐 <i>{_escape(source_display)}</i>  •  🕒 <i>{dt}</i>"
+                else:
+                    info_line = f"🕒 <i>{dt}</i>"
+                text = f"{title_line}\n{info_line}".strip()
 
                 if settings.dry_run:
                     log.info("dry_run_send", extra={"news_id": news_id, "url": url})
@@ -261,8 +294,28 @@ async def sender_loop(conn, settings) -> None:
                             log.debug("send_photo_failed")
                             mid = None
 
-                            # If image is required, try one extra fallback image.
-                            if settings.require_image and settings.image_fallback:
+                            # Try to re-enrich from the publisher page to get a usable on-site image.
+                            try:
+                                og2 = await fetch_og(client, url)
+                                allow_claude_fallback = not bool(getattr(og2, "parsed_html", False)) or not bool(og2.image_url)
+                                if og2.image_url and og2.image_url != image_url:
+                                    try:
+                                        mid = await tg.send_photo(
+                                            chat_id=settings.chat_id,
+                                            photo_url=og2.image_url,
+                                            caption=text,
+                                            reply_markup=button,
+                                        )
+                                        db.set_enrichment(conn, news_id, image_url=og2.image_url, og_description=None)
+                                        image_url = og2.image_url
+                                    except Exception:
+                                        mid = None
+                            except Exception:
+                                pass
+
+                            # If image is required, try one extra fallback image —
+                            # only when the page had no <img> tags or couldn't be fetched.
+                            if settings.require_image and settings.image_fallback and allow_claude_fallback:
                                 alt = await get_fallback_image(
                                     client,
                                     title,
@@ -346,6 +399,13 @@ async def main_async() -> None:
     db_path = os.getenv("DB_PATH", "/data/bot.db")
     conn = db.connect(db_path)
     db.init_schema(conn)
+
+    try:
+        qdel, ndel = db.purge_older_than_days(conn, older_than_days=settings.retention_days)
+        if qdel or ndel:
+            log.info("retention_purge", extra={"queue_deleted": qdel, "news_deleted": ndel})
+    except Exception:
+        log.debug("retention_purge_failed")
     reset = db.reset_stale_sending(conn, older_than_minutes=60)
     if reset:
         log.info("reset_stale_sending", extra={"count": reset})

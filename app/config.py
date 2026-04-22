@@ -56,6 +56,8 @@ class Settings:
     dedup_window_hours: int
     dedup_hamming_max: int
 
+    retention_days: int
+
     claude_token: str | None
     claude_model: str
 
@@ -95,6 +97,8 @@ def load_settings() -> Settings:
 
         dedup_window_hours=_get_int("DEDUP_WINDOW_HOURS", 24),
         dedup_hamming_max=_get_int("DEDUP_HAMMING_MAX", 3),
+
+        retention_days=_get_int("RETENTION_DAYS", 30),
 
         claude_token=_get_env("CLAUDE_TOKEN"),
         claude_model=_get_env("CLAUDE_MODEL", "claude-3-5-haiku-latest") or "claude-3-5-haiku-latest",

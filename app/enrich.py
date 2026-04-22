@@ -20,6 +20,8 @@ class OgData(NamedTuple):
     site_name: str | None
     canonical_url: str | None
     final_url: str | None
+    has_img_tag: bool
+    parsed_html: bool
 
 
 _BAD_IMAGE_HINTS = (
@@ -416,108 +418,146 @@ def _extract_image_candidates(tree: HTMLParser, site_name: str | None, base_host
 
 async def fetch_og(client: httpx.AsyncClient, url: str) -> OgData:
     try:
-        r = await client.get(url, follow_redirects=True)
-        r.raise_for_status()
+        current = url
+        for hop in range(2):
+            r = await client.get(current, follow_redirects=True)
+            r.raise_for_status()
 
-        ctype = (r.headers.get("content-type") or "").lower()
-        # Be conservative: if it's clearly not HTML, don't try to parse.
-        if ctype and ("text/html" not in ctype and "application/xhtml" not in ctype and "xml" not in ctype):
-            return OgData(None, None, None, None, str(r.url))
+            ctype = (r.headers.get("content-type") or "").lower()
+            # Be conservative: if it's clearly not HTML, don't try to parse.
+            if ctype and ("text/html" not in ctype and "application/xhtml" not in ctype and "xml" not in ctype):
+                return OgData(None, None, None, None, str(r.url), False, False)
 
-        # limit parse size
-        html = r.text[:300_000]
-        tree = HTMLParser(html)
-        meta = _extract_meta(tree)
+            # limit parse size
+            html = r.text[:300_000]
+            tree = HTMLParser(html)
+            meta = _extract_meta(tree)
 
-        base_url = str(r.url)
-        base_host = urlparse(base_url).netloc
-        site_name = normalize_text(meta.get("og:site_name") or "") or urlparse(base_url).netloc
-        description = normalize_text(
-            meta.get("og:description")
-            or meta.get("twitter:description")
-            or meta.get("description")
-            or ""
-        )
+            base_url = str(r.url)
+            base_host = urlparse(base_url).netloc
+            site_name = normalize_text(meta.get("og:site_name") or "") or urlparse(base_url).netloc
+            description = normalize_text(
+                meta.get("og:description")
+                or meta.get("twitter:description")
+                or meta.get("description")
+                or ""
+            )
 
-        # canonical URL extraction (avoid publisher home pages)
-        canonical_candidates: list[str] = []
-        og_url = (meta.get("og:url") or meta.get("twitter:url") or "").strip()
-        if og_url:
-            canonical_candidates.append(og_url)
-        canon_link = tree.css_first("link[rel='canonical']")
-        if canon_link is not None:
-            href = (canon_link.attributes.get("href") or "").strip()
-            if href:
-                canonical_candidates.append(href)
-        canonical_candidates.extend(_extract_jsonld_urls(tree))
+            # canonical URL extraction (avoid publisher home pages)
+            canonical_candidates: list[str] = []
+            og_url = (meta.get("og:url") or meta.get("twitter:url") or "").strip()
+            if og_url:
+                canonical_candidates.append(og_url)
+            canon_link = tree.css_first("link[rel='canonical']")
+            if canon_link is not None:
+                href = (canon_link.attributes.get("href") or "").strip()
+                if href:
+                    canonical_candidates.append(href)
+            canonical_candidates.extend(_extract_jsonld_urls(tree))
 
-        canonical_url = None
-        for cand in canonical_candidates:
-            abs_c = urljoin(base_url, cand)
-            # keep only same host or http(s)
-            p = urlparse(abs_c)
-            if p.scheme not in {"http", "https"}:
+            canonical_url = None
+            for cand in canonical_candidates:
+                abs_c = urljoin(base_url, cand)
+                p = urlparse(abs_c)
+                if p.scheme not in {"http", "https"}:
+                    continue
+                if not p.netloc:
+                    continue
+                # avoid trivial homepage canonical
+                if p.netloc.lower().endswith(base_host.lower()) and (p.path in {"", "/"}):
+                    continue
+                canonical_url = abs_c
+                break
+
+            # If we landed on Google News wrapper, re-fetch the publisher page.
+            if hop == 0 and base_host.lower() == "news.google.com" and canonical_url:
+                log.debug("og_google_news_follow", extra={"original": url, "publisher": canonical_url})
+                current = canonical_url
                 continue
-            if not p.netloc:
-                continue
-            # avoid trivial homepage canonical
-            if p.netloc.lower().endswith(base_host.lower()) and (p.path in {"", "/"}):
-                continue
-            canonical_url = abs_c
-            break
 
-        # image candidates (meta first, then article body)
-        meta_imgs: list[tuple[str, int]] = []
-        for k, score in (
-            # Meta images often point to site logos/banners. Keep them as fallback.
-            ("og:image", 14),
-            ("og:image:url", 14),
-            ("og:image:secure_url", 14),
-            ("twitter:image", 13),
-            ("twitter:image:src", 13),
-        ):
-            v = (meta.get(k) or "").strip()
-            if v and not _is_bad_image(v):
-                meta_imgs.append((v, score))
+            # If we are still on Google News and couldn't resolve the publisher URL,
+            # don't treat Google HTML as the news site.
+            if base_host.lower() == "news.google.com" and not canonical_url:
+                log.info("og_google_news_unresolved", extra={"url": url})
+                return OgData(None, None, None, None, base_url, False, False)
 
-        body_imgs = _extract_image_candidates(tree, site_name=site_name, base_host=base_host)
-        all_imgs = meta_imgs + body_imgs
+            root = _find_content_root(tree)
+            has_img_tag = False
+            try:
+                if root is not None:
+                    has_img_tag = bool(root.css_first("img"))
+                if not has_img_tag:
+                    has_img_tag = bool(tree.css_first("img"))
+            except Exception:
+                has_img_tag = False
 
-        best = None
-        best_score = -10**9
-        best_is_meta = False
-        for raw, s in all_imgs:
-            abs_url = urljoin(base_url, raw)
-            score = s
-            low = abs_url.lower()
-            is_meta = s <= 14
-            if any(h in low for h in _BAD_IMAGE_HINTS):
-                score -= 80
-            if low.endswith((".jpg", ".jpeg", ".png", ".webp")):
-                score += 5
-            if low.endswith(".gif"):
-                score -= 10
-            # extra penalty for likely brand images served as og:image
-            if is_meta and any(h in low for h in _BAD_PATH_HINTS):
-                score -= 80
-            if score > best_score:
-                best_score = score
-                best = abs_url
-                best_is_meta = is_meta
+            # image candidates (meta first, then article body)
+            meta_imgs: list[tuple[str, int]] = []
+            for k, score in (
+                # Meta images often point to site logos/banners. Keep them as fallback.
+                ("og:image", 14),
+                ("og:image:url", 14),
+                ("og:image:secure_url", 14),
+                ("twitter:image", 13),
+                ("twitter:image:src", 13),
+            ):
+                v = (meta.get(k) or "").strip()
+                if v and not _is_bad_image(v):
+                    meta_imgs.append((v, score))
 
-        # If the best candidate is still a weak meta image, prefer no photo over portal branding.
-        if best_is_meta and best_score < 26:
-            image_url = None
-        else:
-            image_url = best if best_score >= 12 else None
+            body_imgs = _extract_image_candidates(tree, site_name=site_name, base_host=base_host)
+            all_imgs = meta_imgs + body_imgs
 
-        return OgData(
-            image_url=image_url,
-            description=description or None,
-            site_name=site_name or None,
-            canonical_url=canonical_url,
-            final_url=base_url,
-        )
+            best = None
+            best_score = -10**9
+            best_is_meta = False
+            for raw, s in all_imgs:
+                abs_url = urljoin(base_url, raw)
+                score = s
+                low = abs_url.lower()
+                is_meta = s <= 14
+                if any(h in low for h in _BAD_IMAGE_HINTS):
+                    score -= 80
+                if low.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    score += 5
+                if low.endswith(".gif"):
+                    score -= 10
+                # extra penalty for likely brand images served as og:image
+                if is_meta and any(h in low for h in _BAD_PATH_HINTS):
+                    score -= 80
+                if score > best_score:
+                    best_score = score
+                    best = abs_url
+                    best_is_meta = is_meta
+
+            # If there are body images available, reject weak meta images (likely brand/logo).
+            # If there are NO body images at all, accept og:image as the article image.
+            if best_is_meta and best_score < 26 and body_imgs:
+                image_url = None
+            else:
+                image_url = best if best_score >= 12 else None
+
+            log.debug(
+                "og_result",
+                extra={
+                    "final_url": base_url,
+                    "has_img_tag": bool(has_img_tag),
+                    "image_url": image_url,
+                    "candidates": len(all_imgs),
+                    "best_score": best_score if all_imgs else None,
+                },
+            )
+            return OgData(
+                image_url=image_url,
+                description=description or None,
+                site_name=site_name or None,
+                canonical_url=canonical_url,
+                final_url=base_url,
+                has_img_tag=bool(has_img_tag),
+                parsed_html=True,
+            )
+
+        return OgData(None, None, None, None, None, False, False)
     except Exception as e:
         log.debug("og_fetch_failed", extra={"url": url, "err": str(e)})
-        return OgData(None, None, None, None, None)
+        return OgData(None, None, None, None, None, False, False)

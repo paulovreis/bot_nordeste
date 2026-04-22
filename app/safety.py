@@ -17,6 +17,7 @@ _ADULT_PATTERNS = [
     r"\bprostitui(c|ç)[aã]o\b",
     r"\bstrip(tease)?\b",
     r"\b18\+\b",
+    r"\bacidente\s+de\s+tr[aá]nsito\b",  # common false positive in news, allowlisted but still flagged for manual review
 ]
 
 # allowlist to reduce false positives for politics/news (e.g. "sexo" in demographics)
