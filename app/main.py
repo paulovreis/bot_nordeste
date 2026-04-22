@@ -11,14 +11,24 @@ import httpx
 from . import db
 from .config import load_settings
 from .enrich import fetch_og
+from .image_fallback import get_fallback_image
 from .log import setup_logging
 from .rss import default_queries, fetch_items
 from .safety import classify_text
 from .telegraph import TelegraphClient, build_content
 from .telegram import TelegramClient, build_inline_button
 from .timeutil import SendWindow, parse_hhmm
-from .util import domain_from_url, is_homepage_url, normalize_text, truncate
-from .image_fallback import find_commons_image
+from .util import (
+    bands16,
+    canonicalize_url,
+    domain_from_url,
+    extract_keywords,
+    is_blocked_source_url,
+    is_homepage_url,
+    normalize_text,
+    simhash64,
+    truncate,
+)
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +52,11 @@ async def collector_loop(conn, settings) -> None:
                 total += 1
                 safety_status, safety_reason = classify_text(item.title, item.snippet, None)
 
+                # Story fingerprint for cross-portal dedup (fast; no extra HTTP).
+                tokens = extract_keywords(f"{item.title} {item.snippet}")
+                story_hash = simhash64(tokens)
+                b1, b2, b3, b4 = bands16(story_hash)
+
                 ok = db.upsert_news_and_enqueue(
                     conn,
                     news_id=item.news_id,
@@ -54,6 +69,13 @@ async def collector_loop(conn, settings) -> None:
                     og_description=None,
                     safety_status=safety_status,
                     safety_reason=safety_reason,
+                    story_hash_u64=story_hash,
+                    band1=b1,
+                    band2=b2,
+                    band3=b3,
+                    band4=b4,
+                    dedup_window_hours=settings.dedup_window_hours,
+                    dedup_hamming_max=settings.dedup_hamming_max,
                 )
                 if ok:
                     if safety_status == "adult":
@@ -120,46 +142,60 @@ async def sender_loop(conn, settings) -> None:
                 telegraph_url = row["telegraph_url"]
                 safety_status = row["safety_status"]
 
+                # Hard block: never send non-news sources.
+                if is_blocked_source_url(url):
+                    db.mark_skipped(conn, queue_id, "blocked_source_url")
+                    continue
+
                 # Enrich on-demand (one HTTP request per sent item)
-                # Also enrich if URL looks like a homepage (we need canonical article URL).
-                need_image = settings.require_image and not image_url
-                if need_image or (not og_desc) or is_homepage_url(url):
+                if not image_url or not og_desc or is_homepage_url(url) or domain_from_url(url) == "news.google.com":
                     og = await fetch_og(client, url)
 
-                    # Prefer a real article canonical URL (avoid publisher home pages)
-                    if og.canonical_url and not is_homepage_url(og.canonical_url):
-                        ok = db.set_canonical_url(conn, news_id, og.canonical_url)
-                        if not ok:
-                            # Another row already has this canonical_url; drop as duplicate.
-                            db.mark_sent(conn, queue_id, telegram_message_id=None)
-                            continue
-                        url = og.canonical_url
-                    elif og.final_url and not is_homepage_url(og.final_url):
-                        # At least ensure we are not stuck at '/'
-                        ok = db.set_canonical_url(conn, news_id, og.final_url)
-                        if ok:
-                            url = og.final_url
+                    # If the final URL after redirects is bad, don't send.
+                    if og.final_url and (is_homepage_url(og.final_url) or is_blocked_source_url(og.final_url)):
+                        db.mark_retry(conn, queue_id, f"bad_final_url:{og.final_url}", delay_sec=2 * 3600)
+                        continue
+
+                    # Canonical URL improvement (avoid homepages).
+                    if og.canonical_url:
+                        cand = canonicalize_url(og.canonical_url)
+                        if cand and not is_homepage_url(cand) and not is_blocked_source_url(cand) and cand != url:
+                            ok = db.set_canonical_url(conn, news_id, cand)
+                            if not ok:
+                                try:
+                                    existing = db.get_news_id_by_canonical_url(conn, cand)
+                                    if existing:
+                                        db.mark_news_dedup(
+                                            conn,
+                                            news_id,
+                                            dedup_of_news_id=existing,
+                                            reason="canonical_conflict",
+                                        )
+                                except Exception:
+                                    pass
+                                db.mark_skipped(conn, queue_id, "duplicate_canonical_url")
+                                continue
+                            url = cand
 
                     if og.image_url or og.description:
                         db.set_enrichment(conn, news_id, image_url=og.image_url, og_description=og.description)
                         image_url = image_url or og.image_url
                         og_desc = og_desc or og.description
 
-                # If URL is still homepage, do not send.
-                if is_homepage_url(url):
-                    db.mark_retry(conn, queue_id, "bad_url_homepage", delay_sec=6 * 3600)
-                    continue
-
-                # Image fallback: Wikimedia Commons (free), only when needed.
-                if settings.require_image and not image_url and settings.image_fallback:
-                    fallback = await find_commons_image(client, title)
-                    if fallback:
-                        db.set_enrichment(conn, news_id, image_url=fallback, og_description=None)
-                        image_url = fallback
+                # If we still don't have an image, try fallback chain.
+                if not image_url and settings.image_fallback:
+                    fb = await get_fallback_image(
+                        client,
+                        title,
+                        claude_token=settings.claude_token,
+                        claude_model=settings.claude_model,
+                    )
+                    if fb:
+                        db.set_enrichment(conn, news_id, image_url=fb, og_description=None)
+                        image_url = fb
 
                 if settings.require_image and not image_url:
-                    # Never send without an image (as requested). Retry later.
-                    db.mark_retry(conn, queue_id, "no_image_found", delay_sec=3600)
+                    db.mark_retry(conn, queue_id, "no_image", delay_sec=2 * 3600)
                     continue
 
                 # safety second pass
@@ -222,11 +258,39 @@ async def sender_loop(conn, settings) -> None:
                                 reply_markup=button,
                             )
                         except Exception:
-                            # Fallback to plain message if Telegram can't fetch the image URL.
-                            log.debug("send_photo_failed_fallback")
+                            log.debug("send_photo_failed")
                             mid = None
 
+                            # If image is required, try one extra fallback image.
+                            if settings.require_image and settings.image_fallback:
+                                alt = await get_fallback_image(
+                                    client,
+                                    title,
+                                    claude_token=settings.claude_token,
+                                    claude_model=settings.claude_model,
+                                )
+                                if alt and alt != image_url:
+                                    try:
+                                        mid = await tg.send_photo(
+                                            chat_id=settings.chat_id,
+                                            photo_url=alt,
+                                            caption=text,
+                                            reply_markup=button,
+                                        )
+                                        db.set_enrichment(conn, news_id, image_url=alt, og_description=None)
+                                        image_url = alt
+                                    except Exception:
+                                        mid = None
+
+                            if settings.require_image and not mid:
+                                db.mark_retry(conn, queue_id, "send_photo_failed", delay_sec=30 * 60)
+                                continue
+
                     if not mid:
+                        if settings.require_image:
+                            db.mark_retry(conn, queue_id, "no_image_to_send", delay_sec=30 * 60)
+                            continue
+
                         mid = await tg.send_message(
                             chat_id=settings.chat_id,
                             text=text,
@@ -271,8 +335,12 @@ async def main_async() -> None:
     settings = load_settings()
     setup_logging(settings.log_level)
 
-    if not settings.bot_token or not settings.chat_id or not settings.telegraph_token:
-        log.error("missing_env", extra={"need": ["BOT_TOKEN", "CHAT_ID", "TELEGRAPH_TOKEN"]})
+    if not settings.bot_token or not settings.chat_id:
+        log.error("missing_env", extra={"need": ["BOT_TOKEN", "CHAT_ID"]})
+        raise SystemExit(2)
+
+    if settings.use_telegraph and not settings.telegraph_token:
+        log.error("missing_env", extra={"need": ["TELEGRAPH_TOKEN"]})
         raise SystemExit(2)
 
     db_path = os.getenv("DB_PATH", "/data/bot.db")

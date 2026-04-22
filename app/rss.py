@@ -8,7 +8,7 @@ import feedparser
 from dateutil import parser as dateparser
 
 from .models import NewsItem
-from .util import canonicalize_url, is_homepage_url, make_news_id, normalize_text, truncate
+from .util import canonicalize_url, is_blocked_source_url, is_homepage_url, make_news_id, normalize_text, truncate
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +68,13 @@ def _extract_best_link(entry) -> str | None:
     # Do NOT fallback to <source href>, it is commonly the publisher homepage.
 
     link = (entry.get("link") or "").strip()
-    return link or None
+    if not link:
+        return None
+    if is_homepage_url(link):
+        return None
+    if is_blocked_source_url(link):
+        return None
+    return link
 
 
 def _parse_published(entry) -> datetime | None:
@@ -113,6 +119,19 @@ def fetch_items(
             if not link or not title:
                 continue
 
+            # block non-news sources early (social media, maps, etc.)
+            if is_blocked_source_url(link):
+                continue
+
+            # only accept http(s)
+            try:
+                from urllib.parse import urlparse
+
+                if urlparse(link).scheme not in {"http", "https"}:
+                    continue
+            except Exception:
+                continue
+
             published = _parse_published(entry)
             if not published:
                 continue
@@ -121,6 +140,8 @@ def fetch_items(
                 continue
 
             canonical = canonicalize_url(link)
+            if is_homepage_url(canonical) or is_blocked_source_url(canonical):
+                continue
             source = _extract_source(entry)
             published_iso = published_utc.isoformat(timespec="seconds")
             news_id = make_news_id(canonical, source, published_iso)

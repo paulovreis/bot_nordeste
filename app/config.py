@@ -53,6 +53,12 @@ class Settings:
     require_image: bool
     image_fallback: bool
 
+    dedup_window_hours: int
+    dedup_hamming_max: int
+
+    claude_token: str | None
+    claude_model: str
+
 
 def load_settings() -> Settings:
     bot_token = _get_env("BOT_TOKEN") or ""
@@ -86,4 +92,10 @@ def load_settings() -> Settings:
         queries_override=queries_override,
         require_image=_get_bool("REQUIRE_IMAGE", True),
         image_fallback=_get_bool("IMAGE_FALLBACK", True),
+
+        dedup_window_hours=_get_int("DEDUP_WINDOW_HOURS", 24),
+        dedup_hamming_max=_get_int("DEDUP_HAMMING_MAX", 3),
+
+        claude_token=_get_env("CLAUDE_TOKEN"),
+        claude_model=_get_env("CLAUDE_MODEL", "claude-3-5-haiku-latest") or "claude-3-5-haiku-latest",
     )

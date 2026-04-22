@@ -28,6 +28,8 @@ _BAD_IMAGE_HINTS = (
     "branding",
     "favicon",
     "icon",
+    "avatar",
+    "profile",
     "sprite",
     "share",
     "social",
@@ -416,6 +418,12 @@ async def fetch_og(client: httpx.AsyncClient, url: str) -> OgData:
     try:
         r = await client.get(url, follow_redirects=True)
         r.raise_for_status()
+
+        ctype = (r.headers.get("content-type") or "").lower()
+        # Be conservative: if it's clearly not HTML, don't try to parse.
+        if ctype and ("text/html" not in ctype and "application/xhtml" not in ctype and "xml" not in ctype):
+            return OgData(None, None, None, None, str(r.url))
+
         # limit parse size
         html = r.text[:300_000]
         tree = HTMLParser(html)
@@ -498,7 +506,7 @@ async def fetch_og(client: httpx.AsyncClient, url: str) -> OgData:
                 best_is_meta = is_meta
 
         # If the best candidate is still a weak meta image, prefer no photo over portal branding.
-        if best_is_meta and best_score < 20:
+        if best_is_meta and best_score < 26:
             image_url = None
         else:
             image_url = best if best_score >= 12 else None
