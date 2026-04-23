@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from . import db
+from .browser_resolver import BrowserResolver
 from .config import load_settings
 from .enrich import fetch_og
 from .image_fallback import get_fallback_image
@@ -18,9 +19,6 @@ from .safety import classify_text
 from .telegraph import TelegraphClient, build_content
 from .telegram import TelegramClient, build_inline_button
 from .timeutil import SendWindow, parse_hhmm
-import re
-import base64
-from googlenewsdecoder import gnewsdecoder
 from .util import (
     bands16,
     canonicalize_url,
@@ -34,57 +32,11 @@ from .util import (
 )
 
 log = logging.getLogger(__name__)
-    
-# def resolve_google_news_url(url: str) -> str:
-#     """Decodifica a URL do Google News usando o googlenewsdecoder."""
-#     if "news.google.com" not in url:
-#         return url
-    
-#     try:
-#         decoded_url = gnewsdecoder(url, interval=1)
-        
-#         if decoded_url.get("status"):
-#             return decoded_url["decoded_url"]
-#         else:
-#             log.debug("decode_failed", extra={"url": url, "error": decoded_url.get("message")})
-#     except Exception as e:
-#         log.debug("decode_error", extra={"url": url, "err": str(e)})
-        
-#     return url
 
-async def resolve_google_news_url(client: httpx.AsyncClient, url: str) -> str:
-    """Extrai a URL original usando a API interna do Google News de forma assíncrona."""
-    if "news.google.com" not in url:
-        return url
-        
-    try:
-        # Payload RPC exigido pelo Google
-        rpc_data = f'[[["Fbv4je","[\\"privatelink\\",\\"{url}\\"]",null,"generic"]]]'
-        
-        r = await client.post(
-            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
-            data={"f.req": rpc_data},
-            headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
-            follow_redirects=True
-        )
-        
-        # O Google retorna um JSON sujo. Precisamos extrair a array válida.
-        for line in r.text.split('\n'):
-            if line.startswith('['):
-                data = json.loads(line)
-                if len(data) > 0 and len(data[0]) > 2 and data[0][2]:
-                    inner = json.loads(data[0][2])
-                    if len(inner) > 1:
-                        return inner[1]  # Retorna a URL limpa (ex: tribunadonorte.com.br/...)
-    except Exception as e:
-        log.debug("async_decode_failed", extra={"url": url, "err": str(e)})
-        
-    return url
 
 async def collector_loop(conn, settings) -> None:
     queries = settings.queries_override or default_queries()
 
-    # Collector avoids per-item HTML fetches for performance.
     while True:
         try:
             inserted = 0
@@ -100,7 +52,6 @@ async def collector_loop(conn, settings) -> None:
                 total += 1
                 safety_status, safety_reason = classify_text(item.title, item.snippet, None)
 
-                # Story fingerprint for cross-portal dedup (fast; no extra HTTP).
                 tokens = extract_keywords(f"{item.title} {item.snippet}")
                 story_hash = simhash64(tokens)
                 b1, b2, b3, b4 = bands16(story_hash)
@@ -148,9 +99,13 @@ async def collector_loop(conn, settings) -> None:
         await asyncio.sleep(settings.fetch_interval_min * 60)
 
 
-async def sender_loop(conn, settings) -> None:
+async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
     tz = ZoneInfo(settings.timezone)
-    window = SendWindow(tz=tz, start=parse_hhmm(settings.send_window_start), end=parse_hhmm(settings.send_window_end))
+    window = SendWindow(
+        tz=tz,
+        start=parse_hhmm(settings.send_window_start),
+        end=parse_hhmm(settings.send_window_end),
+    )
 
     timeout = httpx.Timeout(connect=10.0, read=20.0, write=5.0, pool=5.0)
     headers = {
@@ -191,7 +146,6 @@ async def sender_loop(conn, settings) -> None:
             queue_id = int(row["queue_id"])
             news_id = row["news_id"]
 
-            # If we crossed the boundary between selecting and sending, reschedule.
             now_utc = datetime.now(timezone.utc)
             if not window.is_open(now_utc):
                 next_open = window.next_open_utc(now_utc)
@@ -209,25 +163,57 @@ async def sender_loop(conn, settings) -> None:
 
                 allow_claude_fallback = False
 
-                # Hard block: never send non-news sources.
                 if is_blocked_source_url(url):
                     db.mark_skipped(conn, queue_id, "blocked_source_url")
                     continue
-                
-                url = await resolve_google_news_url(client, url)
 
-                # Enrich on-demand (one HTTP request per sent item)
+                # ── Passo 1: Resolução anti-bot via Playwright ───────────────────────────
+                # Acionado SOMENTE para URLs do Google News ainda não enriquecidas.
+                # O resultado é persistido no banco ANTES de qualquer envio ao Telegram,
+                # garantindo que uma falha posterior não force nova raspagem.
+                if "news.google.com" in url and not image_url:
+                    resolved = await resolver.resolve(url)
+                    if resolved is None:
+                        # Browser falhou — adia por 4h e aborta este ciclo
+                        db.mark_retry(conn, queue_id, "browser_resolve_failed", delay_sec=4 * 3600)
+                        continue
+
+                    # Persiste URL final (evita que próximos ciclos entrem neste bloco)
+                    if resolved.final_url and resolved.final_url != url:
+                        new_url = resolved.final_url
+                        ok = db.set_canonical_url(conn, news_id, new_url)
+                        if not ok:
+                            existing = db.get_news_id_by_canonical_url(conn, new_url)
+                            if existing:
+                                db.mark_news_dedup(
+                                    conn,
+                                    news_id,
+                                    dedup_of_news_id=existing,
+                                    reason="browser_canonical_conflict",
+                                )
+                            db.mark_skipped(conn, queue_id, "duplicate_canonical_url")
+                            continue
+                        url = new_url
+
+                    # Persiste imagem imediatamente — próximos ciclos não precisam raspar
+                    if resolved.image_url:
+                        db.set_enrichment(conn, news_id, image_url=resolved.image_url, og_description=None)
+                        image_url = resolved.image_url
+
+                # ── Passo 2: Enrich via httpx para notícias não-Google ───────────────────
+                # Também cobre o caso em que o Playwright resolveu a URL mas não teve imagem.
                 if not image_url or not og_desc or is_homepage_url(url) or domain_from_url(url) == "news.google.com":
                     og = await fetch_og(client, url)
-                    # Fallback only when page couldn't be fetched or returned no usable image.
-                    allow_claude_fallback = not bool(getattr(og, "parsed_html", False)) or not bool(og.image_url)
+                    allow_claude_fallback = (
+                        not bool(getattr(og, "parsed_html", False)) or not bool(og.image_url)
+                    )
 
-                    # If the final URL after redirects is bad, don't send.
-                    if og.final_url and (is_homepage_url(og.final_url) or is_blocked_source_url(og.final_url)):
+                    if og.final_url and (
+                        is_homepage_url(og.final_url) or is_blocked_source_url(og.final_url)
+                    ):
                         db.mark_retry(conn, queue_id, f"bad_final_url:{og.final_url}", delay_sec=2 * 3600)
                         continue
 
-                    # Canonical URL improvement (avoid homepages).
                     if og.canonical_url:
                         cand = canonicalize_url(og.canonical_url)
                         if cand and not is_homepage_url(cand) and not is_blocked_source_url(cand) and cand != url:
@@ -253,14 +239,10 @@ async def sender_loop(conn, settings) -> None:
                         image_url = image_url or og.image_url
                         og_desc = og_desc or og.description
 
-                # If we still don't have an image, try fallback chain — but only
-                # when the article page had no <img> tags or couldn't be fetched.
+                # ── Passo 3: Fallback de imagem via Claude ───────────────────────────────
                 if not image_url and settings.image_fallback and allow_claude_fallback:
-                    _fallback_reason = "fetch_error" if not getattr(og, "parsed_html", False) else "no_img_tags"
-                    log.info(
-                        "image_fallback_start",
-                        extra={"news_id": news_id, "url": url, "reason": _fallback_reason},
-                    )
+                    _reason = "fetch_error" if not getattr(og, "parsed_html", False) else "no_img_tags"
+                    log.info("image_fallback_start", extra={"news_id": news_id, "url": url, "reason": _reason})
                     fb = await get_fallback_image(
                         client,
                         title,
@@ -276,13 +258,14 @@ async def sender_loop(conn, settings) -> None:
                     db.mark_retry(conn, queue_id, "no_image", delay_sec=2 * 3600)
                     continue
 
-                # safety second pass
+                # ── Passo 4: Verificação de segurança ────────────────────────────────────
                 if safety_status != "adult":
                     status2, reason2 = classify_text(title, snippet, og_desc)
                     if status2 == "adult":
                         db.mark_retry(conn, queue_id, f"blocked_by_safety:{reason2}", delay_sec=6 * 3600)
                         continue
 
+                # ── Passo 5: Telegraph (opcional) ────────────────────────────────────────
                 if settings.use_telegraph and tgraph and not telegraph_url:
                     published_local = datetime.fromisoformat(row["published_at"]).astimezone(tz)
                     content_nodes = build_content(
@@ -300,6 +283,7 @@ async def sender_loop(conn, settings) -> None:
                     )
                     db.set_telegraph_url(conn, news_id, telegraph_url)
 
+                # ── Passo 6: Envio ao Telegram ───────────────────────────────────────────
                 button_url = telegraph_url if (settings.use_telegraph and telegraph_url) else url
                 button = build_inline_button("LEITURA RÁPIDA", button_url)
 
@@ -314,17 +298,17 @@ async def sender_loop(conn, settings) -> None:
                 if domain and (not source_display or source_display == "google-news"):
                     source_display = domain
                 elif domain and source_display and domain not in source_display.lower():
-                    # Keep source concise and informative
                     source_display = domain
                 if source_display.strip().lower() == "news.google.com":
                     source_display = ""
 
                 dt = published_local.strftime("%d/%m/%Y %H:%M")
                 title_line = f"📰 <b>{_escape(normalize_text(title))}</b>"
-                if source_display:
-                    info_line = f"🌐 <i>{_escape(source_display)}</i>  •  🕒 <i>{dt}</i>"
-                else:
-                    info_line = f"🕒 <i>{dt}</i>"
+                info_line = (
+                    f"🌐 <i>{_escape(source_display)}</i>  •  🕒 <i>{dt}</i>"
+                    if source_display
+                    else f"🕒 <i>{dt}</i>"
+                )
                 text = f"{title_line}\n{info_line}".strip()
 
                 if settings.dry_run:
@@ -341,13 +325,16 @@ async def sender_loop(conn, settings) -> None:
                                 reply_markup=button,
                             )
                         except Exception:
-                            log.debug("send_photo_failed")
+                            log.debug("send_photo_failed", extra={"news_id": news_id})
                             mid = None
 
-                            # Try to re-enrich from the publisher page to get a usable on-site image.
+                            # Tenta re-enrich apenas via httpx (nunca volta ao Playwright)
                             try:
                                 og2 = await fetch_og(client, url)
-                                allow_claude_fallback = not bool(getattr(og2, "parsed_html", False)) or not bool(og2.image_url)
+                                allow_claude_fallback = (
+                                    not bool(getattr(og2, "parsed_html", False))
+                                    or not bool(og2.image_url)
+                                )
                                 if og2.image_url and og2.image_url != image_url:
                                     try:
                                         mid = await tg.send_photo(
@@ -363,9 +350,7 @@ async def sender_loop(conn, settings) -> None:
                             except Exception:
                                 pass
 
-                            # If image is required, try one extra fallback image —
-                            # only when the page had no <img> tags or couldn't be fetched.
-                            if settings.require_image and settings.image_fallback and allow_claude_fallback:
+                            if settings.require_image and settings.image_fallback and allow_claude_fallback and not mid:
                                 alt = await get_fallback_image(
                                     client,
                                     title,
@@ -406,10 +391,8 @@ async def sender_loop(conn, settings) -> None:
 
             except Exception as e:
                 log.exception("send_error", extra={"queue_id": queue_id})
-                # backoff: 5m, 15m, 1h, 6h
                 attempts = 1
                 try:
-                    # best effort fetch current attempts
                     r2 = conn.execute("SELECT attempts FROM queue WHERE id=?", (queue_id,)).fetchone()
                     if r2:
                         attempts = int(r2[0]) + 1
@@ -426,12 +409,7 @@ async def sender_loop(conn, settings) -> None:
 
 
 def _escape(s: str) -> str:
-    return (
-        (s or "")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 async def main_async() -> None:
@@ -456,16 +434,22 @@ async def main_async() -> None:
             log.info("retention_purge", extra={"queue_deleted": qdel, "news_deleted": ndel})
     except Exception:
         log.debug("retention_purge_failed")
+
     reset = db.reset_stale_sending(conn, older_than_minutes=60)
     if reset:
         log.info("reset_stale_sending", extra={"count": reset})
 
     log.info("startup", extra={"db_path": db_path, "dry_run": settings.dry_run})
 
-    await asyncio.gather(
-        collector_loop(conn, settings),
-        sender_loop(conn, settings),
-    )
+    resolver = BrowserResolver(max_concurrent=2)
+    await resolver.start()
+    try:
+        await asyncio.gather(
+            collector_loop(conn, settings),
+            sender_loop(conn, settings, resolver),
+        )
+    finally:
+        await resolver.stop()
 
 
 def main() -> None:
