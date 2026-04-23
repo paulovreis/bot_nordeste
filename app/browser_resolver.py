@@ -16,7 +16,7 @@ _LAUNCH_ARGS = [
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
-    "--no-zygote",                          # evita processo zygote; mais leve que --single-process
+    "--no-zygote",
     "--disable-extensions",
     "--disable-background-networking",
     "--disable-sync",
@@ -38,7 +38,6 @@ _LAUNCH_ARGS = [
     "--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process",
 ]
 
-# Aguarda até a URL não estar mais no Google News (JS redirect)
 _GOOGLE_NEWS_HOST = "news.google.com"
 _JS_REDIRECT_TIMEOUT_MS = 10_000
 _NAV_TIMEOUT_MS = 25_000
@@ -51,16 +50,7 @@ class ResolvedItem:
 
 
 class BrowserResolver:
-    """Gerenciador de browser Playwright reutilizável e otimizado para VPS de baixo recurso.
-
-    Lifecycle:
-        resolver = BrowserResolver()
-        await resolver.start()
-        try:
-            result = await resolver.resolve("https://news.google.com/...")
-        finally:
-            await resolver.stop()
-    """
+    """Gerenciador de browser Playwright reutilizável e otimizado para VPS de baixo recurso."""
 
     def __init__(self, *, max_concurrent: int = 2, nav_timeout_ms: int = _NAV_TIMEOUT_MS):
         self._sem = asyncio.Semaphore(max_concurrent)
@@ -101,11 +91,7 @@ class BrowserResolver:
         log.info("browser_resolver_stopped")
 
     async def resolve(self, url: str) -> ResolvedItem | None:
-        """Navega até *url*, aguarda redirecionamentos e extrai URL final + og:image.
-
-        Abre um contexto isolado (cookies zerados) por chamada e o fecha ao terminar.
-        Retorna None em caso de falha.
-        """
+        """Navega até a URL, passa pelo bloqueio do Google e extrai apenas a URL final."""
         if self._browser is None:
             raise RuntimeError("BrowserResolver não iniciado — chame start() antes de resolve().")
 
@@ -131,6 +117,14 @@ class BrowserResolver:
                     },
                 )
 
+                # Injeta o cookie de consentimento para não travar no redirecionamento do Google
+                await context.add_cookies([{
+                    "name": "CONSENT",
+                    "value": "YES+cb.20230101-01-p0.pt-BR+FX+410",
+                    "domain": ".google.com",
+                    "path": "/"
+                }])
+
                 page = await context.new_page()
 
                 # Intercepta e aborta recursos pesados para poupar CPU/rede
@@ -149,54 +143,31 @@ class BrowserResolver:
                     timeout=self._nav_timeout,
                 )
 
-                # Google News faz JS redirect — aguarda sair do domínio
+                # Aguarda até que a URL final deixe de ser o Google News ou o Consent
                 if _GOOGLE_NEWS_HOST in page.url:
                     try:
                         await page.wait_for_url(
-                            lambda u: _GOOGLE_NEWS_HOST not in u,
+                            lambda u: _GOOGLE_NEWS_HOST not in u and "consent.google.com" not in u,
                             timeout=_JS_REDIRECT_TIMEOUT_MS,
                         )
                     except Exception:
-                        log.debug(
-                            "browser_still_on_google_news",
-                            extra={"url": url, "current": page.url},
-                        )
+                        pass
 
                 final_url = page.url
 
-                # Extrai og:image (e fallback twitter:image) via JS no contexto da página
-                image_url: str | None = await page.evaluate(
-                    """
-                    () => {
-                        const sel = [
-                            'meta[property="og:image"]',
-                            'meta[property="og:image:url"]',
-                            'meta[name="twitter:image"]',
-                            'meta[name="twitter:image:src"]',
-                        ];
-                        for (const s of sel) {
-                            const m = document.querySelector(s);
-                            if (m) {
-                                const v = m.getAttribute('content');
-                                if (v && v.trim()) return v.trim();
-                            }
-                        }
-                        return null;
-                    }
-                    """
-                )
+                # Se falhou e continua no Google, descarta para tentar de novo mais tarde
+                if _GOOGLE_NEWS_HOST in final_url or "consent.google.com" in final_url:
+                    log.warning("browser_bypass_failed", extra={"url": url, "final_url": final_url})
+                    return None
 
-                log.debug(
-                    "browser_resolved",
-                    extra={
-                        "original": url,
-                        "final": final_url,
-                        "has_image": bool(image_url),
-                    },
-                )
+                log.debug("browser_resolved", extra={"original": url, "final": final_url})
+                
+                # Devolvemos a imagem vazia de propósito!
+                # Isso forçará o main.py a acionar o fetch_og e usar o seu enrich.py 
+                # para buscar as imagens de alta qualidade direto no corpo do site.
                 return ResolvedItem(
                     final_url=final_url,
-                    image_url=image_url or None,
+                    image_url=None, 
                 )
 
             except Exception as exc:
