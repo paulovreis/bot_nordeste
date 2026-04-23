@@ -39,15 +39,14 @@ def resolve_google_news_url(url: str) -> str:
         return url
         
     try:
-        # Extrai o hash base64 da URL
         b64_str = url.split("articles/")[1].split("?")[0]
         b64_str += "=" * ((4 - len(b64_str) % 4) % 4)
         
-        # Decodifica e busca a URL final via Regex dentro do binário (protobuf)
         decoded = base64.urlsafe_b64decode(b64_str)
-        match = re.search(rb'https?://[^\x00-\x1F\x7F]+', decoded)
+        # RegEx mais precisa para URLs dentro de binários
+        match = re.search(rb'https?://[a-zA-Z0-9\-\.\/\?\&\=\_\%\+]+', decoded)
         
-        print("Decoded URL:", match.group(0).decode('utf-8') if match else "No URL found")
+        print(f"Decoded URL: {match.group(0).decode('utf-8') if match else 'No match found'}")  # Debug log
         
         if match:
             return match.group(0).decode('utf-8')
@@ -189,7 +188,7 @@ async def sender_loop(conn, settings) -> None:
                     db.mark_skipped(conn, queue_id, "blocked_source_url")
                     continue
                 
-                url = await resolve_google_news_url(url)
+                url = resolve_google_news_url(url)
 
                 # Enrich on-demand (one HTTP request per sent item)
                 if not image_url or not og_desc or is_homepage_url(url) or domain_from_url(url) == "news.google.com":
