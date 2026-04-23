@@ -8,6 +8,7 @@ from playwright_stealth import stealth_async as _stealth_async  # falha no start
 
 log = logging.getLogger(__name__)
 
+# Voltamos a bloquear tudo para economizar sua RAM e vCPU!
 _BLOCKED_RESOURCE_TYPES = frozenset({"stylesheet", "font", "image", "media"})
 
 # Chromium flags otimizados para ambiente VPS (1 vCPU / 4GB RAM)
@@ -16,7 +17,7 @@ _LAUNCH_ARGS = [
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
-    "--no-zygote",                          # evita processo zygote; mais leve que --single-process
+    "--no-zygote",
     "--disable-extensions",
     "--disable-background-networking",
     "--disable-sync",
@@ -38,9 +39,8 @@ _LAUNCH_ARGS = [
     "--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process",
 ]
 
-# Aguarda até a URL não estar mais no Google News (JS redirect)
 _GOOGLE_NEWS_HOST = "news.google.com"
-_JS_REDIRECT_TIMEOUT_MS = 10_000
+_JS_REDIRECT_TIMEOUT_MS = 6_000  # Reduzido para não perder tempo
 _NAV_TIMEOUT_MS = 25_000
 
 
@@ -51,16 +51,7 @@ class ResolvedItem:
 
 
 class BrowserResolver:
-    """Gerenciador de browser Playwright reutilizável e otimizado para VPS de baixo recurso.
-
-    Lifecycle:
-        resolver = BrowserResolver()
-        await resolver.start()
-        try:
-            result = await resolver.resolve("https://news.google.com/...")
-        finally:
-            await resolver.stop()
-    """
+    """Gerenciador de browser Playwright reutilizável e otimizado para VPS de baixo recurso."""
 
     def __init__(self, *, max_concurrent: int = 2, nav_timeout_ms: int = _NAV_TIMEOUT_MS):
         self._sem = asyncio.Semaphore(max_concurrent)
@@ -69,7 +60,6 @@ class BrowserResolver:
         self._browser = None
 
     async def start(self) -> None:
-        """Inicia o Playwright e abre uma única instância do Chromium."""
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
@@ -85,7 +75,6 @@ class BrowserResolver:
         log.info("browser_resolver_started")
 
     async def stop(self) -> None:
-        """Fecha o browser e o Playwright de forma segura."""
         if self._browser:
             try:
                 await self._browser.close()
@@ -101,11 +90,6 @@ class BrowserResolver:
         log.info("browser_resolver_stopped")
 
     async def resolve(self, url: str) -> ResolvedItem | None:
-        """Navega até *url*, aguarda redirecionamentos e extrai URL final + og:image.
-
-        Abre um contexto isolado (cookies zerados) por chamada e o fecha ao terminar.
-        Retorna None em caso de falha.
-        """
         if self._browser is None:
             raise RuntimeError("BrowserResolver não iniciado — chame start() antes de resolve().")
 
@@ -149,7 +133,7 @@ class BrowserResolver:
                     timeout=self._nav_timeout,
                 )
 
-                # Google News faz JS redirect — aguarda sair do domínio
+                # Tenta aguardar o JS redirect (provavelmente vai falhar pelo bloqueio)
                 if _GOOGLE_NEWS_HOST in page.url:
                     try:
                         await page.wait_for_url(
@@ -157,46 +141,43 @@ class BrowserResolver:
                             timeout=_JS_REDIRECT_TIMEOUT_MS,
                         )
                     except Exception:
-                        log.debug(
-                            "browser_still_on_google_news",
-                            extra={"url": url, "current": page.url},
-                        )
+                        pass
 
                 final_url = page.url
 
-                # Extrai og:image (e fallback twitter:image) via JS no contexto da página
-                image_url: str | None = await page.evaluate(
-                    """
-                    () => {
-                        const sel = [
-                            'meta[property="og:image"]',
-                            'meta[property="og:image:url"]',
-                            'meta[name="twitter:image"]',
-                            'meta[name="twitter:image:src"]',
-                        ];
-                        for (const s of sel) {
-                            const m = document.querySelector(s);
-                            if (m) {
-                                const v = m.getAttribute('content');
-                                if (v && v.trim()) return v.trim();
-                            }
-                        }
-                        return null;
-                    }
-                    """
-                )
+                # Se ainda estiver na página do Google News, usamos o DOM para extrair a URL de destino
+                if _GOOGLE_NEWS_HOST in final_url or "consent.google.com" in final_url:
+                    extracted_url = await page.evaluate('''() => {
+                        // Tenta pegar a url do c-wiz (formato novo do google)
+                        const cwiz = document.querySelector('c-wiz[data-n-v-url]');
+                        if (cwiz) return cwiz.getAttribute('data-n-v-url');
+                        
+                        // Tenta pegar o primeiro link real na tela (fallback)
+                        const links = Array.from(document.querySelectorAll('a'));
+                        const realLink = links.find(a => a.href && !a.href.includes('google.com') && a.href.startsWith('http'));
+                        return realLink ? realLink.href : null;
+                    }''')
+                    
+                    if extracted_url:
+                        final_url = extracted_url
+                    else:
+                        log.warning("browser_bypass_failed", extra={"url": url})
+                        return None
 
                 log.debug(
                     "browser_resolved",
                     extra={
                         "original": url,
                         "final": final_url,
-                        "has_image": bool(image_url),
+                        "has_image": False,
                     },
                 )
+                
+                # RETORNAMOS NONE PARA A IMAGEM!
+                # Isso obriga a main.py a usar o seu arquivo enrich.py maravilhoso para ler o HTML do portal de notícias.
                 return ResolvedItem(
                     final_url=final_url,
-                    image_url=image_url or None,
+                    image_url=None,
                 )
 
             except Exception as exc:
