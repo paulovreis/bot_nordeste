@@ -20,6 +20,7 @@ from .telegram import TelegramClient, build_inline_button
 from .timeutil import SendWindow, parse_hhmm
 import re
 import base64
+from googlenewsdecoder import gnewsdecoder
 from .util import (
     bands16,
     canonicalize_url,
@@ -35,23 +36,19 @@ from .util import (
 log = logging.getLogger(__name__)
     
 def resolve_google_news_url(url: str) -> str:
-    if "news.google.com/rss/articles/CBMi" not in url:
+    """Decodifica a URL do Google News usando o googlenewsdecoder."""
+    if "news.google.com" not in url:
         return url
-        
+    
     try:
-        b64_str = url.split("articles/")[1].split("?")[0]
-        b64_str += "=" * ((4 - len(b64_str) % 4) % 4)
+        decoded_url = gnewsdecoder(url, interval=1)
         
-        decoded = base64.urlsafe_b64decode(b64_str)
-        # RegEx mais precisa para URLs dentro de binários
-        match = re.search(rb'https?://[a-zA-Z0-9\-\.\/\?\&\=\_\%\+]+', decoded)
-        
-        print(f"Decoded URL: {match.group(0).decode('utf-8') if match else 'No match found'}")  # Debug log
-        
-        if match:
-            return match.group(0).decode('utf-8')
-    except Exception:
-        pass
+        if decoded_url.get("status"):
+            return decoded_url["decoded_url"]
+        else:
+            log.debug("decode_failed", extra={"url": url, "error": decoded_url.get("message")})
+    except Exception as e:
+        log.debug("decode_error", extra={"url": url, "err": str(e)})
         
     return url
 
