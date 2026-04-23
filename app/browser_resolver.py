@@ -4,13 +4,13 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from playwright_stealth import stealth_async as _stealth_async  # falha no startup se não instalado
+from playwright_stealth import stealth_async as _stealth_async
 
 log = logging.getLogger(__name__)
 
-_BLOCKED_RESOURCE_TYPES = frozenset({"stylesheet", "font", "image", "media"})
+# Liberei 'image' e 'stylesheet' porque o Google precisa deles para executar o JS de redirect
+_BLOCKED_RESOURCE_TYPES = frozenset({"font", "media"})
 
-# Chromium flags otimizados para ambiente VPS (1 vCPU / 4GB RAM)
 _LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -50,8 +50,6 @@ class ResolvedItem:
 
 
 class BrowserResolver:
-    """Gerenciador de browser Playwright reutilizável e otimizado para VPS de baixo recurso."""
-
     def __init__(self, *, max_concurrent: int = 2, nav_timeout_ms: int = _NAV_TIMEOUT_MS):
         self._sem = asyncio.Semaphore(max_concurrent)
         self._nav_timeout = nav_timeout_ms
@@ -59,23 +57,16 @@ class BrowserResolver:
         self._browser = None
 
     async def start(self) -> None:
-        """Inicia o Playwright e abre uma única instância do Chromium."""
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
-            raise RuntimeError(
-                "playwright não instalado. Execute: pip install playwright && playwright install chromium"
-            ) from exc
+            raise RuntimeError("playwright não instalado.") from exc
 
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-            args=_LAUNCH_ARGS,
-        )
+        self._browser = await self._playwright.chromium.launch(headless=True, args=_LAUNCH_ARGS)
         log.info("browser_resolver_started")
 
     async def stop(self) -> None:
-        """Fecha o browser e o Playwright de forma segura."""
         if self._browser:
             try:
                 await self._browser.close()
@@ -91,9 +82,8 @@ class BrowserResolver:
         log.info("browser_resolver_stopped")
 
     async def resolve(self, url: str) -> ResolvedItem | None:
-        """Navega até a URL, passa pelo bloqueio do Google e extrai apenas a URL final."""
         if self._browser is None:
-            raise RuntimeError("BrowserResolver não iniciado — chame start() antes de resolve().")
+            raise RuntimeError("BrowserResolver não iniciado.")
 
         async with self._sem:
             context = None
@@ -107,17 +97,9 @@ class BrowserResolver:
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    extra_http_headers={
-                        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-                        "Accept": (
-                            "text/html,application/xhtml+xml,application/xml;"
-                            "q=0.9,image/webp,*/*;q=0.8"
-                        ),
-                    },
+                    )
                 )
 
-                # Injeta o cookie de consentimento para não travar no redirecionamento do Google
                 await context.add_cookies([{
                     "name": "CONSENT",
                     "value": "YES+cb.20230101-01-p0.pt-BR+FX+410",
@@ -127,7 +109,6 @@ class BrowserResolver:
 
                 page = await context.new_page()
 
-                # Intercepta e aborta recursos pesados para poupar CPU/rede
                 async def _handle_route(route):
                     if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
                         await route.abort()
@@ -137,13 +118,8 @@ class BrowserResolver:
                 await page.route("**/*", _handle_route)
                 await _stealth_async(page)
 
-                await page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=self._nav_timeout,
-                )
+                await page.goto(url, wait_until="domcontentloaded", timeout=self._nav_timeout)
 
-                # Aguarda até que a URL final deixe de ser o Google News ou o Consent
                 if _GOOGLE_NEWS_HOST in page.url:
                     try:
                         await page.wait_for_url(
@@ -155,20 +131,31 @@ class BrowserResolver:
 
                 final_url = page.url
 
-                # Se falhou e continua no Google, descarta para tentar de novo mais tarde
+                # Extração à força pelo DOM caso o redirect JS falhe
                 if _GOOGLE_NEWS_HOST in final_url or "consent.google.com" in final_url:
-                    log.warning("browser_bypass_failed", extra={"url": url, "final_url": final_url})
+                    extracted_url = await page.evaluate('''() => {
+                        const cwiz = document.querySelector('c-wiz[data-n-v-url]');
+                        if (cwiz) return cwiz.getAttribute('data-n-v-url');
+                        
+                        const links = Array.from(document.querySelectorAll('a'));
+                        const realLink = links.find(a => a.href && !a.href.includes('google.com'));
+                        return realLink ? realLink.href : null;
+                    }''')
+                    
+                    if extracted_url:
+                        final_url = extracted_url
+                    else:
+                        log.warning("browser_bypass_failed", extra={"url": url, "final_url": final_url})
+                        return None
+
+                # Se o Google bater de frente com o Captcha
+                if "sorry/index" in final_url:
+                    log.warning("captcha_hit", extra={"url": url})
                     return None
 
                 log.debug("browser_resolved", extra={"original": url, "final": final_url})
                 
-                # Devolvemos a imagem vazia de propósito!
-                # Isso forçará o main.py a acionar o fetch_og e usar o seu enrich.py 
-                # para buscar as imagens de alta qualidade direto no corpo do site.
-                return ResolvedItem(
-                    final_url=final_url,
-                    image_url=None, 
-                )
+                return ResolvedItem(final_url=final_url, image_url=None)
 
             except Exception as exc:
                 log.warning("browser_resolve_failed", extra={"url": url, "err": str(exc)})
