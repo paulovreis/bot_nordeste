@@ -31,7 +31,10 @@ _ADULT_PATTERNS = [
     r"\brefugiado(s)?\b",  # common false positive in news, allowlisted but still flagged for manual review
     r"\bconcurso\b",  # common false positive in news (e.g. "concurso de beleza"), allowlisted but still flagged for manual review
     r"\bconcursos\b",  # common false positive in news (e.g. "concursos públicos"), allowlisted but still flagged for manual review
-    
+    r"\bbaleado\b",
+    r"\bferido\b",
+    r"\btiro\b",
+    r"\bmorre\b",
 ]
 
 # allowlist to reduce false positives for politics/news (e.g. "sexo" in demographics)
