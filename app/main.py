@@ -174,8 +174,8 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                 if "news.google.com" in url and not image_url:
                     resolved = await resolver.resolve(url)
                     if resolved is None:
-                        # Browser falhou — adia por 4h e aborta este ciclo
                         db.mark_retry(conn, queue_id, "browser_resolve_failed", delay_sec=4 * 3600)
+                        await asyncio.sleep(3)
                         continue
 
                     # Persiste URL final (evita que próximos ciclos entrem neste bloco)

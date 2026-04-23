@@ -4,6 +4,8 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
+from playwright_stealth import stealth_async as _stealth_async  # falha no startup se não instalado
+
 log = logging.getLogger(__name__)
 
 _BLOCKED_RESOURCE_TYPES = frozenset({"stylesheet", "font", "image", "media"})
@@ -110,12 +112,6 @@ class BrowserResolver:
         async with self._sem:
             context = None
             try:
-                from playwright_stealth import stealth_async
-            except ImportError:
-                log.error("playwright_stealth não instalado: pip install playwright-stealth")
-                return None
-
-            try:
                 context = await self._browser.new_context(
                     java_script_enabled=True,
                     bypass_csp=True,
@@ -145,7 +141,7 @@ class BrowserResolver:
                         await route.continue_()
 
                 await page.route("**/*", _handle_route)
-                await stealth_async(page)
+                await _stealth_async(page)
 
                 await page.goto(
                     url,
