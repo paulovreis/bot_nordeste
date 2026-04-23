@@ -18,6 +18,7 @@ from .safety import classify_text
 from .telegraph import TelegraphClient, build_content
 from .telegram import TelegramClient, build_inline_button
 from .timeutil import SendWindow, parse_hhmm
+import re
 from .util import (
     bands16,
     canonicalize_url,
@@ -32,6 +33,17 @@ from .util import (
 
 log = logging.getLogger(__name__)
 
+async def resolve_google_news_url(client: httpx.AsyncClient, url: str) -> str:
+    if "news.google.com" not in url:
+        return url
+        
+    try:
+        response = await client.get(url, follow_redirects=True)
+        # A página do Google geralmente contém um link com o destino final
+        match = re.search(r'<a[^>]*href="([^"]+)"', response.text)
+        return match.group(1) if match else url
+    except Exception:
+        return url
 
 async def collector_loop(conn, settings) -> None:
     queries = settings.queries_override or default_queries()
@@ -165,6 +177,8 @@ async def sender_loop(conn, settings) -> None:
                 if is_blocked_source_url(url):
                     db.mark_skipped(conn, queue_id, "blocked_source_url")
                     continue
+                
+                url = await resolve_google_news_url(client, url)
 
                 # Enrich on-demand (one HTTP request per sent item)
                 if not image_url or not og_desc or is_homepage_url(url) or domain_from_url(url) == "news.google.com":
