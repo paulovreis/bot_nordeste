@@ -35,20 +35,49 @@ from .util import (
 
 log = logging.getLogger(__name__)
     
-def resolve_google_news_url(url: str) -> str:
-    """Decodifica a URL do Google News usando o googlenewsdecoder."""
+# def resolve_google_news_url(url: str) -> str:
+#     """Decodifica a URL do Google News usando o googlenewsdecoder."""
+#     if "news.google.com" not in url:
+#         return url
+    
+#     try:
+#         decoded_url = gnewsdecoder(url, interval=1)
+        
+#         if decoded_url.get("status"):
+#             return decoded_url["decoded_url"]
+#         else:
+#             log.debug("decode_failed", extra={"url": url, "error": decoded_url.get("message")})
+#     except Exception as e:
+#         log.debug("decode_error", extra={"url": url, "err": str(e)})
+        
+#     return url
+
+async def resolve_google_news_url(client: httpx.AsyncClient, url: str) -> str:
+    """Extrai a URL original usando a API interna do Google News de forma assíncrona."""
     if "news.google.com" not in url:
         return url
-    
-    try:
-        decoded_url = gnewsdecoder(url, interval=1)
         
-        if decoded_url.get("status"):
-            return decoded_url["decoded_url"]
-        else:
-            log.debug("decode_failed", extra={"url": url, "error": decoded_url.get("message")})
+    try:
+        # Payload RPC exigido pelo Google
+        rpc_data = f'[[["Fbv4je","[\\"privatelink\\",\\"{url}\\"]",null,"generic"]]]'
+        
+        r = await client.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            data={"f.req": rpc_data},
+            headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+            follow_redirects=True
+        )
+        
+        # O Google retorna um JSON sujo. Precisamos extrair a array válida.
+        for line in r.text.split('\n'):
+            if line.startswith('['):
+                data = json.loads(line)
+                if len(data) > 0 and len(data[0]) > 2 and data[0][2]:
+                    inner = json.loads(data[0][2])
+                    if len(inner) > 1:
+                        return inner[1]  # Retorna a URL limpa (ex: tribunadonorte.com.br/...)
     except Exception as e:
-        log.debug("decode_error", extra={"url": url, "err": str(e)})
+        log.debug("async_decode_failed", extra={"url": url, "err": str(e)})
         
     return url
 
@@ -185,7 +214,7 @@ async def sender_loop(conn, settings) -> None:
                     db.mark_skipped(conn, queue_id, "blocked_source_url")
                     continue
                 
-                url = resolve_google_news_url(url)
+                url = await resolve_google_news_url(client, url)
 
                 # Enrich on-demand (one HTTP request per sent item)
                 if not image_url or not og_desc or is_homepage_url(url) or domain_from_url(url) == "news.google.com":
