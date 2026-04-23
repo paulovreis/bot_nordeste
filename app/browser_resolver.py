@@ -43,12 +43,11 @@ class BrowserResolver:
 
     def __init__(self, **kwargs):
         # ATENÇÃO: Insira a SUA chave aqui, ou configure a variável de ambiente.
-        print("Api key: ", os.getenv("SCRAPER_API_KEY", "").strip())
         self.api_key = os.getenv("SCRAPER_API_KEY", "").strip()
         self.api_url = "http://api.scraperapi.com"
 
     async def start(self) -> None:
-        if not self.api_key or self.api_key == "ab6206d826ecf3a34d93afec797d133c":
+        if not self.api_key:
             log.error("SCRAPER_API_KEY inválida ou não configurada!")
         log.info("scraper_api_resolver_started")
 
