@@ -3,15 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
-from playwright_stealth import stealth_async as _stealth_async  # falha no startup se não instalado
+from playwright_stealth import stealth_async as _stealth_async
 
 log = logging.getLogger(__name__)
 
-# Voltamos a bloquear tudo para economizar sua RAM e vCPU!
-_BLOCKED_RESOURCE_TYPES = frozenset({"stylesheet", "font", "image", "media"})
+# AGORA SIM! Liberei 'image' e 'stylesheet' para imitar um usuário real.
+# Só estamos bloqueando fontes pesadas e vídeos para poupar CPU/Rede.
+_BLOCKED_RESOURCE_TYPES = frozenset({"font", "media"})
 
-# Chromium flags otimizados para ambiente VPS (1 vCPU / 4GB RAM)
 _LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -40,19 +41,15 @@ _LAUNCH_ARGS = [
 ]
 
 _GOOGLE_NEWS_HOST = "news.google.com"
-_JS_REDIRECT_TIMEOUT_MS = 6_000  # Reduzido para não perder tempo
-_NAV_TIMEOUT_MS = 25_000
-
+_JS_REDIRECT_TIMEOUT_MS = 12_000
+_NAV_TIMEOUT_MS = 30_000
 
 @dataclass(frozen=True)
 class ResolvedItem:
     final_url: str
     image_url: str | None
 
-
 class BrowserResolver:
-    """Gerenciador de browser Playwright reutilizável e otimizado para VPS de baixo recurso."""
-
     def __init__(self, *, max_concurrent: int = 2, nav_timeout_ms: int = _NAV_TIMEOUT_MS):
         self._sem = asyncio.Semaphore(max_concurrent)
         self._nav_timeout = nav_timeout_ms
@@ -63,9 +60,7 @@ class BrowserResolver:
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
-            raise RuntimeError(
-                "playwright não instalado. Execute: pip install playwright && playwright install chromium"
-            ) from exc
+            raise RuntimeError("playwright não instalado.") from exc
 
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
@@ -91,7 +86,7 @@ class BrowserResolver:
 
     async def resolve(self, url: str) -> ResolvedItem | None:
         if self._browser is None:
-            raise RuntimeError("BrowserResolver não iniciado — chame start() antes de resolve().")
+            raise RuntimeError("BrowserResolver não iniciado.")
 
         async with self._sem:
             context = None
@@ -108,16 +103,28 @@ class BrowserResolver:
                     ),
                     extra_http_headers={
                         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-                        "Accept": (
-                            "text/html,application/xhtml+xml,application/xml;"
-                            "q=0.9,image/webp,*/*;q=0.8"
-                        ),
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                     },
                 )
 
+                # Cookies modernos para burlar o consent.google.com
+                await context.add_cookies([
+                    {
+                        "name": "SOCS",
+                        "value": "CAESHAgCEhJnd3NfMjAyMzA4MTAtMF9SQzI6cHQtQlI6QU0aCgkJGAgJCgkJGAg=",
+                        "domain": ".google.com",
+                        "path": "/"
+                    },
+                    {
+                        "name": "CONSENT",
+                        "value": "PENDING+900",
+                        "domain": ".google.com",
+                        "path": "/"
+                    }
+                ])
+
                 page = await context.new_page()
 
-                # Intercepta e aborta recursos pesados para poupar CPU/rede
                 async def _handle_route(route):
                     if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
                         await route.abort()
@@ -133,52 +140,66 @@ class BrowserResolver:
                     timeout=self._nav_timeout,
                 )
 
-                # Tenta aguardar o JS redirect (provavelmente vai falhar pelo bloqueio)
-                if _GOOGLE_NEWS_HOST in page.url:
-                    try:
-                        await page.wait_for_url(
-                            lambda u: _GOOGLE_NEWS_HOST not in u,
-                            timeout=_JS_REDIRECT_TIMEOUT_MS,
-                        )
-                    except Exception:
-                        pass
+                # Aguarda até que o domínio não seja mais google.com
+                try:
+                    await page.wait_for_url(
+                        lambda u: "google.com" not in urlparse(u).netloc,
+                        timeout=_JS_REDIRECT_TIMEOUT_MS,
+                    )
+                except Exception:
+                    pass
 
                 final_url = page.url
 
-                # Se ainda estiver na página do Google News, usamos o DOM para extrair a URL de destino
-                if _GOOGLE_NEWS_HOST in final_url or "consent.google.com" in final_url:
+                # Plano de Segurança Máxima: se ainda estiver preso no Google
+                if "google.com" in urlparse(final_url).netloc:
                     extracted_url = await page.evaluate('''() => {
-                        // Tenta pegar a url do c-wiz (formato novo do google)
+                        // 1. Pega a URL do atributo c-wiz (padrão atual do interstitial)
                         const cwiz = document.querySelector('c-wiz[data-n-v-url]');
                         if (cwiz) return cwiz.getAttribute('data-n-v-url');
                         
-                        // Tenta pegar o primeiro link real na tela (fallback)
+                        // 2. Busca qualquer link 'a' que não aponte para o google
                         const links = Array.from(document.querySelectorAll('a'));
-                        const realLink = links.find(a => a.href && !a.href.includes('google.com') && a.href.startsWith('http'));
-                        return realLink ? realLink.href : null;
+                        for (const a of links) {
+                            if (a.href && a.href.startsWith('http') && !a.href.includes('google.com')) {
+                                return a.href;
+                            }
+                        }
+
+                        // 3. Tenta forçar clique em botões de "Aceitar Tudo" caso não tenha saído do consent
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        const acceptBtn = btns.find(b => /(aceitar|accept|concordo)/i.test(b.innerText));
+                        if (acceptBtn) acceptBtn.click();
+                        else {
+                            const forms = document.querySelectorAll('form');
+                            if (forms.length > 0) forms[0].submit();
+                        }
+
+                        return null;
                     }''')
                     
                     if extracted_url:
                         final_url = extracted_url
                     else:
-                        log.warning("browser_bypass_failed", extra={"url": url})
-                        return None
+                        # Dá uma margem de tempo caso ele tenha acabado de clicar no botão "Aceitar"
+                        try:
+                            await page.wait_for_url(
+                                lambda u: "google.com" not in urlparse(u).netloc,
+                                timeout=4000,
+                            )
+                            final_url = page.url
+                        except Exception:
+                            pass
 
-                log.debug(
-                    "browser_resolved",
-                    extra={
-                        "original": url,
-                        "final": final_url,
-                        "has_image": False,
-                    },
-                )
+                # Se ao fim de tudo ele não saiu, registra a falha
+                if "google.com" in urlparse(final_url).netloc:
+                    log.warning("browser_bypass_failed", extra={"url": url, "final_url": final_url})
+                    return None
+
+                log.debug("browser_resolved", extra={"original": url, "final": final_url})
                 
-                # RETORNAMOS NONE PARA A IMAGEM!
-                # Isso obriga a main.py a usar o seu arquivo enrich.py maravilhoso para ler o HTML do portal de notícias.
-                return ResolvedItem(
-                    final_url=final_url,
-                    image_url=None,
-                )
+                # Retorna NONE na imagem para forçar o enrich.py a fazer a extração profunda da foto real
+                return ResolvedItem(final_url=final_url, image_url=None)
 
             except Exception as exc:
                 log.warning("browser_resolve_failed", extra={"url": url, "err": str(exc)})
