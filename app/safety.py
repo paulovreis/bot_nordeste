@@ -25,6 +25,13 @@ _ADULT_PATTERNS = [
     r"\bmorte\b",  # common false positive in news, allowlisted but still flagged for manual review
     r"\bassassinato\b",  # common false positive in news, allowlisted but still flagged for manual review
     r"\bacidente\b",  # common false positive in news, allowlisted but still flagged for manual review
+    r"\bdesastre\b",  # common false positive in news, allowlisted but still flagged for manual review
+    r"\bguerra\b",  # common false positive in news, allowlisted but still flagged for manual review
+    r"\bconflito\b",  # common false positive in news, allowlisted but still flagged for manual review
+    r"\brefugiado(s)?\b",  # common false positive in news, allowlisted but still flagged for manual review
+    r"\bconcurso\b",  # common false positive in news (e.g. "concurso de beleza"), allowlisted but still flagged for manual review
+    r"\bconcursos\b",  # common false positive in news (e.g. "concursos públicos"), allowlisted but still flagged for manual review
+    
 ]
 
 # allowlist to reduce false positives for politics/news (e.g. "sexo" in demographics)

@@ -19,6 +19,7 @@ from .telegraph import TelegraphClient, build_content
 from .telegram import TelegramClient, build_inline_button
 from .timeutil import SendWindow, parse_hhmm
 import re
+import base64
 from .util import (
     bands16,
     canonicalize_url,
@@ -32,18 +33,28 @@ from .util import (
 )
 
 log = logging.getLogger(__name__)
-
-async def resolve_google_news_url(client: httpx.AsyncClient, url: str) -> str:
-    if "news.google.com" not in url:
+    
+def resolve_google_news_url(url: str) -> str:
+    if "news.google.com/rss/articles/CBMi" not in url:
         return url
         
     try:
-        response = await client.get(url, follow_redirects=True)
-        # A página do Google geralmente contém um link com o destino final
-        match = re.search(r'<a[^>]*href="([^"]+)"', response.text)
-        return match.group(1) if match else url
+        # Extrai o hash base64 da URL
+        b64_str = url.split("articles/")[1].split("?")[0]
+        b64_str += "=" * ((4 - len(b64_str) % 4) % 4)
+        
+        # Decodifica e busca a URL final via Regex dentro do binário (protobuf)
+        decoded = base64.urlsafe_b64decode(b64_str)
+        match = re.search(rb'https?://[^\x00-\x1F\x7F]+', decoded)
+        
+        print("Decoded URL:", match.group(0).decode('utf-8') if match else "No URL found")
+        
+        if match:
+            return match.group(0).decode('utf-8')
     except Exception:
-        return url
+        pass
+        
+    return url
 
 async def collector_loop(conn, settings) -> None:
     queries = settings.queries_override or default_queries()
@@ -178,7 +189,7 @@ async def sender_loop(conn, settings) -> None:
                     db.mark_skipped(conn, queue_id, "blocked_source_url")
                     continue
                 
-                url = await resolve_google_news_url(client, url)
+                url = await resolve_google_news_url(url)
 
                 # Enrich on-demand (one HTTP request per sent item)
                 if not image_url or not og_desc or is_homepage_url(url) or domain_from_url(url) == "news.google.com":
