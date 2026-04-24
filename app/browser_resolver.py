@@ -92,9 +92,11 @@ class BrowserResolver:
             for _ in range(max_attempts):
                 params = {
                     "api_key": self.active_key,
+                    # Garanta que a URL sempre tenha o prefixo correto
                     "url": url if url.startswith("http") else f"https://{url}",
                     "follow_redirect": "true",
-                    "premium": "true",
+                    "render": "true",  # Alterado: Necessário para processar redirecionamentos JS do Google
+                    "premium": "true",  # Novo: Usa pool de proxies premium que não estão bloqueados pelo Google
                     "country_code": "br",
                 }
 
