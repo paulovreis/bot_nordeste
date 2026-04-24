@@ -35,6 +35,11 @@ _ADULT_PATTERNS = [
     r"\bferido\b",
     r"\btiro\b",
     r"\bmorre\b",
+    r"\btombo\b",
+    r"\btombou\b",
+    r"\bcarregad[ao]\b",
+    r"\bpreta\b",
+    r"\bMG\b",
 ]
 
 # allowlist to reduce false positives for politics/news (e.g. "sexo" in demographics)
