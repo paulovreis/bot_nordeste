@@ -33,6 +33,8 @@ from .util import (
 
 log = logging.getLogger(__name__)
 
+_MAX_BROWSER_RETRIES = 1
+
 
 async def collector_loop(conn, settings) -> None:
     queries = settings.queries_override or default_queries()
@@ -145,6 +147,8 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
 
             queue_id = int(row["queue_id"])
             news_id = row["news_id"]
+            q_attempts = int(row["attempts"] or 0)
+            q_last_error = row["last_error"] or ""
 
             now_utc = datetime.now(timezone.utc)
             if not window.is_open(now_utc):
@@ -167,43 +171,82 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                     db.mark_skipped(conn, queue_id, "blocked_source_url")
                     continue
 
-                # ── Passo 1: Resolução anti-bot via Playwright ───────────────────────────
-                # Acionado SOMENTE para URLs do Google News ainda não enriquecidas.
-                # O resultado é persistido no banco ANTES de qualquer envio ao Telegram,
-                # garantindo que uma falha posterior não force nova raspagem.
+                # ── Passo 1: Resolução de URL do Google News ─────────────────────────────
+                # Tenta primeiro via fetch_og (gratuito). ScraperAPI é usado somente como
+                # fallback quando o fetch_og não consegue escapar do domínio google.com.
+                # Créditos do ScraperAPI são gastos apenas se nenhuma alternativa funcionar.
+                og = None
+
                 if "news.google.com" in url and not image_url:
-                    resolved = await resolver.resolve(url)
-                    if resolved is None:
-                        db.mark_retry(conn, queue_id, "browser_resolve_failed", delay_sec=4 * 3600)
-                        await asyncio.sleep(3)
+                    # Limita retries para não queimar créditos em URLs que falham repetidamente
+                    if q_attempts >= _MAX_BROWSER_RETRIES and "browser_resolve_failed" in q_last_error:
+                        db.mark_skipped(conn, queue_id, "browser_resolve_max_retries")
                         continue
 
-                    # Persiste URL final (evita que próximos ciclos entrem neste bloco)
-                    if resolved.final_url and resolved.final_url != url:
-                        new_url = resolved.final_url
-                        ok = db.set_canonical_url(conn, news_id, new_url)
-                        if not ok:
-                            existing = db.get_news_id_by_canonical_url(conn, new_url)
-                            if existing:
-                                db.mark_news_dedup(
-                                    conn,
-                                    news_id,
-                                    dedup_of_news_id=existing,
-                                    reason="browser_canonical_conflict",
-                                )
-                            db.mark_skipped(conn, queue_id, "duplicate_canonical_url")
+                    # Tenta resolução gratuita: fetch_og já segue canonical do Google News
+                    og_pre = await fetch_og(client, url)
+                    free_resolved = bool(og_pre.final_url and "google.com" not in og_pre.final_url)
+
+                    if free_resolved:
+                        free_url_raw = og_pre.canonical_url or og_pre.final_url
+                        free_url = canonicalize_url(free_url_raw) if free_url_raw else None
+
+                        if not free_url or is_homepage_url(free_url) or is_blocked_source_url(free_url):
+                            db.mark_retry(conn, queue_id, f"bad_free_url:{free_url}", delay_sec=2 * 3600)
                             continue
-                        url = new_url
 
-                    # Persiste imagem imediatamente — próximos ciclos não precisam raspar
-                    if resolved.image_url:
-                        db.set_enrichment(conn, news_id, image_url=resolved.image_url, og_description=None)
-                        image_url = resolved.image_url
+                        if free_url != url:
+                            ok = db.set_canonical_url(conn, news_id, free_url)
+                            if not ok:
+                                existing = db.get_news_id_by_canonical_url(conn, free_url)
+                                if existing:
+                                    db.mark_news_dedup(
+                                        conn,
+                                        news_id,
+                                        dedup_of_news_id=existing,
+                                        reason="browser_canonical_conflict",
+                                    )
+                                db.mark_skipped(conn, queue_id, "duplicate_canonical_url")
+                                continue
+                            url = free_url
 
-                # ── Passo 2: Enrich via httpx para notícias não-Google ───────────────────
-                # Também cobre o caso em que o Playwright resolveu a URL mas não teve imagem.
-                if not image_url or not og_desc or is_homepage_url(url) or domain_from_url(url) == "news.google.com":
+                        og = og_pre  # dados de OG já obtidos — reutiliza no Passo 2
+                        log.info("free_resolve_succeeded", extra={"original": row["canonical_url"], "final": url})
+
+                    else:
+                        # Fallback: ScraperAPI com renderização JS (1 crédito)
+                        resolved = await resolver.resolve(url)
+                        if resolved is None:
+                            db.mark_retry(conn, queue_id, "browser_resolve_failed", delay_sec=4 * 3600)
+                            await asyncio.sleep(3)
+                            continue
+
+                        if resolved.final_url and resolved.final_url != url:
+                            new_url = resolved.final_url
+                            ok = db.set_canonical_url(conn, news_id, new_url)
+                            if not ok:
+                                existing = db.get_news_id_by_canonical_url(conn, new_url)
+                                if existing:
+                                    db.mark_news_dedup(
+                                        conn,
+                                        news_id,
+                                        dedup_of_news_id=existing,
+                                        reason="browser_canonical_conflict",
+                                    )
+                                db.mark_skipped(conn, queue_id, "duplicate_canonical_url")
+                                continue
+                            url = new_url
+
+                        if resolved.image_url:
+                            db.set_enrichment(conn, news_id, image_url=resolved.image_url, og_description=None)
+                            image_url = resolved.image_url
+
+                # ── Passo 2: Enrich via httpx ────────────────────────────────────────────
+                # Pulado se fetch_og já resolveu o Google News no Passo 1 (og != None).
+                if og is None and (not image_url or not og_desc or is_homepage_url(url) or domain_from_url(url) == "news.google.com"):
                     og = await fetch_og(client, url)
+
+                if og is not None:
                     allow_claude_fallback = (
                         not bool(getattr(og, "parsed_html", False)) or not bool(og.image_url)
                     )

@@ -326,7 +326,8 @@ def get_next_queued(conn: sqlite3.Connection, now_utc: datetime) -> sqlite3.Row 
         row = conn.execute(
             """
             SELECT q.id as queue_id, q.news_id, n.title, n.canonical_url, n.source, n.published_at,
-                   n.snippet, n.image_url, n.og_description, n.telegraph_url, n.safety_status
+                   n.snippet, n.image_url, n.og_description, n.telegraph_url, n.safety_status,
+                   q.attempts, q.last_error
             FROM queue q
             JOIN news n ON n.news_id = q.news_id
             WHERE q.status IN ('queued', 'retry')
