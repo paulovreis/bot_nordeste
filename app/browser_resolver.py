@@ -7,13 +7,11 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-# Regex para encontrar a URL final e a Imagem dentro do HTML retornado pelo proxy
 _OG_URL_RE = re.compile(rb'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']', re.I)
 _CANONICAL_RE = re.compile(rb'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']', re.I)
 _OG_IMAGE_RE = re.compile(rb'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
 
 def _extract_from_html(body: bytes) -> tuple[str | None, str | None]:
-    """Extrai final_url e image_url do HTML processado pelo ScraperAPI."""
     url: str | None = None
     image: str | None = None
 
@@ -39,14 +37,12 @@ class ResolvedItem:
     image_url: str | None
 
 class BrowserResolver:
-    """Resolve Google News redirect URLs via ScraperAPI."""
-
     def __init__(self, **kwargs):
         self.api_key = os.getenv("SCRAPER_API_KEY", "").strip()
         self.api_url = "http://api.scraperapi.com"
 
     async def start(self) -> None:
-        if not self.api_key or self.api_key == "ab6206d826ecf3a34d93afec797d133c":
+        if not self.api_key:
             log.error("SCRAPER_API_KEY inválida ou não configurada!")
         log.info("scraper_api_resolver_started")
 
@@ -61,14 +57,13 @@ class BrowserResolver:
             log.warning("scraper_api_no_key", extra={"url": url})
             return None
 
-        # CORREÇÃO CRÍTICA: Remove o /rss/ da URL do Google News para evitar o Erro 404
-        clean_url = url.replace("/rss/articles/", "/articles/")
-
+        # PARÂMETROS CORRIGIDOS
         params = {
             "api_key": self.api_key,
-            "url": clean_url,
+            "url": url, # Usa a URL original do RSS, sem cortes
             "follow_redirect": "true",
             "render": "false",
+            "country_code": "br" # FORÇA O USO DE PROXY NO BRASIL (Evita o erro 404 geográfico do Google News)
         }
 
         try:
@@ -76,8 +71,8 @@ class BrowserResolver:
                 r = await client.get(self.api_url, params=params)
                 
                 if r.status_code != 200:
+                    print(f"Erro na API do ScraperAPI: {r.status_code} - {r.text}")
                     log.warning("scraper_api_error", extra={"status": r.status_code})
-                    print(f"Erro ao acessar ScraperAPI: {r.status_code} - {r.text[:500]}")
                     return None
 
                 final_url, image_url = _extract_from_html(r.content)
