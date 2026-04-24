@@ -92,21 +92,29 @@ class BrowserResolver:
             for _ in range(max_attempts):
                 params = {
                     "api_key": self.active_key,
-                    # Garanta que a URL sempre tenha o prefixo correto
                     "url": url if url.startswith("http") else f"https://{url}",
                     "follow_redirect": "true",
-                    "render": "true",  # Alterado: Necessário para processar redirecionamentos JS do Google
-                    "premium": "true",  # Novo: Usa pool de proxies premium que não estão bloqueados pelo Google
+                    "premium": "true",
                     "country_code": "br",
                 }
 
                 try:
                     r = await client.get(self.api_url, params=params)
 
-                    # 403 ou 429 indica que os créditos da chave atual acabaram
                     if r.status_code in (403, 429):
-                        self._rotate_key()
-                        continue  # Tenta de novo com a nova chave
+                        # Só rotaciona a chave se o erro for do próprio ScraperAPI (cota/chave inválida).
+                        # 403 do site alvo é repassado com corpo diferente — não adianta tentar outra chave.
+                        body_lower = r.text.lower()
+                        print(f"Resposta do ScraperAPI: {r.status_code} - {r.text}")
+                        is_api_error = any(
+                            phrase in body_lower
+                            for phrase in ("invalid api key", "out of credits", "quota", "unauthorized", "api credits")
+                        )
+                        if is_api_error:
+                            self._rotate_key()
+                            continue
+                        log.warning("scraper_api_target_403", extra={"url": url, "status": r.status_code})
+                        return None
 
                     if r.status_code != 200:
                         print(f"Erro ao acessar ScraperAPI: {r.status_code} - {r.text}")
