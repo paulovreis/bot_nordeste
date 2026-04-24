@@ -49,7 +49,7 @@ class BrowserResolver:
     def __init__(self, **kwargs):
         # Carrega todas as chaves separadas por vírgula
         keys_env = os.getenv(
-            "SCRAPER_API_KEYS", os.getenv("SCRAPER_API_KEY", "")
+            "SCRAPER_API_KEYS", os.getenv("SCRAPER_API_KEYS", "")
         ).strip()
         self.api_keys = [k.strip() for k in keys_env.split(",") if k.strip()]
         self.current_key_index = 0
@@ -91,7 +91,7 @@ class BrowserResolver:
         async with httpx.AsyncClient(timeout=60.0) as client:
             for _ in range(max_attempts):
                 params = {
-                    "api_key": self.api_key,
+                    "api_key": self.active_key,
                     # Garanta que a URL sempre tenha o prefixo correto
                     "url": url if url.startswith("http") else f"https://{url}",
                     "follow_redirect": "true",
