@@ -4,7 +4,7 @@ import logging
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from .util import hamming64
 
@@ -67,6 +67,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_queue_status_next ON queue(status, next_attempt_at);
         CREATE INDEX IF NOT EXISTS idx_news_published ON news(published_at);
+
+        CREATE TABLE IF NOT EXISTS scraper_api_keys (
+            key TEXT PRIMARY KEY,
+            exhausted_on TEXT NOT NULL
+        );
         """
     )
 
@@ -436,6 +441,24 @@ def mark_news_dedup(
         WHERE news_id=?
         """,
         (dedup_of_news_id, reason[:500], news_id),
+    )
+
+
+def load_exhausted_keys(conn: sqlite3.Connection) -> dict[str, date]:
+    rows = conn.execute("SELECT key, exhausted_on FROM scraper_api_keys").fetchall()
+    result: dict[str, date] = {}
+    for row in rows:
+        try:
+            result[row["key"]] = date.fromisoformat(row["exhausted_on"])
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+def save_key_exhausted(conn: sqlite3.Connection, key: str, exhausted_on: date) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO scraper_api_keys (key, exhausted_on) VALUES (?, ?)",
+        (key, exhausted_on.isoformat()),
     )
 
 

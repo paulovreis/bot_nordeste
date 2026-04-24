@@ -1,9 +1,14 @@
 from __future__ import annotations
+import datetime
 import logging
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
+
 import httpx
+
+from . import db
 
 log = logging.getLogger(__name__)
 
@@ -16,6 +21,8 @@ _CANONICAL_RE = re.compile(
 _OG_IMAGE_RE = re.compile(
     rb'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I
 )
+
+_CREDIT_ERROR_PHRASES = ("invalid api key", "out of credits", "quota", "unauthorized", "api credits")
 
 
 def _extract_from_html(body: bytes) -> tuple[str | None, str | None]:
@@ -39,6 +46,12 @@ def _extract_from_html(body: bytes) -> tuple[str | None, str | None]:
     return url, image
 
 
+def _next_month_first(d: datetime.date) -> datetime.date:
+    if d.month == 12:
+        return datetime.date(d.year + 1, 1, 1)
+    return datetime.date(d.year, d.month + 1, 1)
+
+
 @dataclass(frozen=True)
 class ResolvedItem:
     final_url: str
@@ -46,31 +59,36 @@ class ResolvedItem:
 
 
 class BrowserResolver:
-    def __init__(self, **kwargs):
-        # Carrega todas as chaves separadas por vírgula
-        keys_env = os.getenv(
-            "SCRAPER_API_KEYS", os.getenv("SCRAPER_API_KEYS", "")
-        ).strip()
-        self.api_keys = [k.strip() for k in keys_env.split(",") if k.strip()]
-        self.current_key_index = 0
+    def __init__(self, conn: sqlite3.Connection):
+        keys_env = os.getenv("SCRAPER_API_KEYS", "").strip()
+        self.api_keys: list[str] = [k.strip() for k in keys_env.split(",") if k.strip()]
+        self._conn = conn
+        self._exhausted: dict[str, datetime.date] = {}
         self.api_url = "http://api.scraperapi.com"
 
-    @property
-    def active_key(self) -> str | None:
-        return self.api_keys[self.current_key_index] if self.api_keys else None
+    def _available_keys(self) -> list[str]:
+        today = datetime.date.today()
+        return [
+            k for k in self.api_keys
+            if k not in self._exhausted or today >= _next_month_first(self._exhausted[k])
+        ]
 
-    def _rotate_key(self):
-        if len(self.api_keys) > 1:
-            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-            log.warning(
-                "scraper_api_key_rotated", extra={"new_index": self.current_key_index}
-            )
+    def _mark_exhausted(self, key: str) -> None:
+        today = datetime.date.today()
+        self._exhausted[key] = today
+        db.save_key_exhausted(self._conn, key, today)
+        log.warning(
+            "scraper_api_key_exhausted",
+            extra={"key_suffix": key[-4:], "available_remaining": len(self._available_keys())},
+        )
 
     async def start(self) -> None:
+        self._exhausted = db.load_exhausted_keys(self._conn)
         if not self.api_keys:
             log.error("Nenhuma SCRAPER_API_KEY configurada!")
         log.info(
-            "scraper_api_resolver_started", extra={"total_keys": len(self.api_keys)}
+            "scraper_api_resolver_started",
+            extra={"total_keys": len(self.api_keys), "exhausted_keys": len(self._exhausted)},
         )
 
     async def stop(self) -> None:
@@ -80,57 +98,42 @@ class BrowserResolver:
         if "news.google.com" not in url:
             return ResolvedItem(final_url=url, image_url=None)
 
-        if not self.api_keys:
-            log.warning("scraper_api_no_key")
+        available = self._available_keys()
+        if not available:
+            log.warning("scraper_api_no_key_available")
             return None
 
-        max_attempts = len(
-            self.api_keys
-        )  # Tenta no máximo o número de chaves que você tem
+        target_url = url if url.startswith("http") else f"https://{url}"
 
         async with httpx.AsyncClient(timeout=60.0) as client:
-            for _ in range(max_attempts):
+            for key in available:
                 params = {
-                    "api_key": self.active_key,
-                    # Garanta que a URL sempre tenha o prefixo correto
-                    "url": url if url.startswith("http") else f"https://{url}",
+                    "api_key": key,
+                    "url": target_url,
                     "follow_redirect": "true",
-                    "render": "true",  # Alterado: Necessário para processar redirecionamentos JS do Google
-                    "premium": "true",  # Novo: Usa pool de proxies premium que não estão bloqueados pelo Google
+                    "render": "true",
+                    "premium": "true",
                     "country_code": "br",
                 }
-
                 try:
                     r = await client.get(self.api_url, params=params)
 
                     if r.status_code in (403, 429):
-                        # Só rotaciona a chave se o erro for do próprio ScraperAPI (cota/chave inválida).
-                        # 403 do site alvo é repassado com corpo diferente — não adianta tentar outra chave.
                         body_lower = r.text.lower()
                         print(f"Resposta do ScraperAPI: {r.status_code} - {r.text}")
-                        is_api_error = any(
-                            phrase in body_lower
-                            for phrase in ("invalid api key", "out of credits", "quota", "unauthorized", "api credits")
-                        )
-                        if is_api_error:
-                            self._rotate_key()
+                        if any(p in body_lower for p in _CREDIT_ERROR_PHRASES):
+                            self._mark_exhausted(key)
                             continue
                         log.warning("scraper_api_target_403", extra={"url": url, "status": r.status_code})
                         return None
 
                     if r.status_code != 200:
                         print(f"Erro ao acessar ScraperAPI: {r.status_code} - {r.text}")
-                        log.warning(
-                            "scraper_api_error", extra={"status": r.status_code}
-                        )
+                        log.warning("scraper_api_error", extra={"status": r.status_code})
                         return None
 
                     final_url, image_url = _extract_from_html(r.content)
-
-                    if final_url:
-                        return ResolvedItem(final_url=final_url, image_url=image_url)
-
-                    return None
+                    return ResolvedItem(final_url=final_url, image_url=image_url) if final_url else None
 
                 except Exception as exc:
                     print(f"Erro ao acessar ScraperAPI: {exc}")

@@ -484,7 +484,7 @@ async def main_async() -> None:
 
     log.info("startup", extra={"db_path": db_path, "dry_run": settings.dry_run})
 
-    resolver = BrowserResolver(max_concurrent=2)
+    resolver = BrowserResolver(conn)
     await resolver.start()
     try:
         await asyncio.gather(
