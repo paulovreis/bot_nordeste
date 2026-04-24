@@ -42,12 +42,11 @@ class BrowserResolver:
     """Resolve Google News redirect URLs via ScraperAPI."""
 
     def __init__(self, **kwargs):
-        # ATENÇÃO: Insira a SUA chave aqui, ou configure a variável de ambiente.
         self.api_key = os.getenv("SCRAPER_API_KEY", "").strip()
         self.api_url = "http://api.scraperapi.com"
 
     async def start(self) -> None:
-        if not self.api_key:
+        if not self.api_key or self.api_key == "ab6206d826ecf3a34d93afec797d133c":
             log.error("SCRAPER_API_KEY inválida ou não configurada!")
         log.info("scraper_api_resolver_started")
 
@@ -62,30 +61,29 @@ class BrowserResolver:
             log.warning("scraper_api_no_key", extra={"url": url})
             return None
 
+        # CORREÇÃO CRÍTICA: Remove o /rss/ da URL do Google News para evitar o Erro 404
+        clean_url = url.replace("/rss/articles/", "/articles/")
+
         params = {
             "api_key": self.api_key,
-            "url": url,
+            "url": clean_url,
             "follow_redirect": "true",
             "render": "false",
         }
 
         try:
-            # 60s de timeout porque os proxies da ScraperAPI podem demorar um pouco para responder
             async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.get(self.api_url, params=params)
                 
-                # Se não retornou 200, a chave está errada ou os créditos acabaram
                 if r.status_code != 200:
-                    print(f"Erro ao acessar ScraperAPI: {r.status_code} - {r.text}")
-                    log.warning("scraper_api_error", extra={"status": r.status_code, "body": r.text})
+                    log.warning("scraper_api_error", extra={"status": r.status_code})
+                    print(f"Erro ao acessar ScraperAPI: {r.status_code} - {r.text[:500]}")
                     return None
 
-                # Extrai a URL verdadeira e a Imagem direto do HTML fornecido
                 final_url, image_url = _extract_from_html(r.content)
 
                 if final_url:
                     log.info("scraper_api_resolved", extra={"original": url, "final": final_url})
-                    # Como já pegamos a imagem por regex aqui, passamos pro main.py.
                     return ResolvedItem(final_url=final_url, image_url=image_url)
 
                 log.warning("scraper_api_unresolved", extra={"url": url})
