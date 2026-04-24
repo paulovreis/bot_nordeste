@@ -54,7 +54,7 @@ async def collector_loop(conn, settings) -> None:
                 total += 1
                 safety_status, safety_reason = classify_text(item.title, item.snippet, None)
 
-                tokens = extract_keywords(f"{item.title} {item.snippet}")
+                tokens = extract_keywords(item.title)
                 story_hash = simhash64(tokens)
                 b1, b2, b3, b4 = bands16(story_hash)
 
@@ -478,7 +478,7 @@ async def main_async() -> None:
     except Exception:
         log.debug("retention_purge_failed")
 
-    reset = db.reset_stale_sending(conn, older_than_minutes=60)
+    reset = db.reset_stale_sending(conn, older_than_minutes=0)
     if reset:
         log.info("reset_stale_sending", extra={"count": reset})
 

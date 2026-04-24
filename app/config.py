@@ -96,7 +96,7 @@ def load_settings() -> Settings:
         image_fallback=_get_bool("IMAGE_FALLBACK", True),
 
         dedup_window_hours=_get_int("DEDUP_WINDOW_HOURS", 24),
-        dedup_hamming_max=_get_int("DEDUP_HAMMING_MAX", 3),
+        dedup_hamming_max=_get_int("DEDUP_HAMMING_MAX", 8),
 
         retention_days=_get_int("RETENTION_DAYS", 30),
 
