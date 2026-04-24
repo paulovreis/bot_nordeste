@@ -39,6 +39,9 @@ _ADULT_PATTERNS = [
     r"\btombou\b",
     r"\bcarregad[ao]\b",
     r"\bpreta\b",
+    r"\bfutebol\b",
+    r"\bgol\b",
+    r"\bpartida\b",
 ]
 
 # allowlist to reduce false positives for politics/news (e.g. "sexo" in demographics)
