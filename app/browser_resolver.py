@@ -76,6 +76,7 @@ class BrowserResolver:
                 
                 # Se não retornou 200, a chave está errada ou os créditos acabaram
                 if r.status_code != 200:
+                    print(f"Erro ao acessar ScraperAPI: {r.status_code} - {r.text}")
                     log.warning("scraper_api_error", extra={"status": r.status_code, "body": r.text})
                     return None
 
