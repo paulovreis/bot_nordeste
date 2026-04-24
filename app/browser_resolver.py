@@ -60,10 +60,12 @@ class BrowserResolver:
         # PARÂMETROS CORRIGIDOS
         params = {
             "api_key": self.api_key,
-            "url": url, # Usa a URL original do RSS, sem cortes
+            # Garanta que a URL sempre tenha o prefixo correto
+            "url": url if url.startswith("http") else f"https://{url}", 
             "follow_redirect": "true",
-            "render": "false",
-            "country_code": "br" # FORÇA O USO DE PROXY NO BRASIL (Evita o erro 404 geográfico do Google News)
+            "render": "true", # Alterado: Necessário para processar redirecionamentos JS do Google
+            "premium": "true", # Novo: Usa pool de proxies premium que não estão bloqueados pelo Google
+            "country_code": "br"
         }
 
         try:
