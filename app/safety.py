@@ -29,8 +29,6 @@ _ADULT_PATTERNS = [
     r"\bguerra\b",  # common false positive in news, allowlisted but still flagged for manual review
     r"\bconflito\b",  # common false positive in news, allowlisted but still flagged for manual review
     r"\brefugiado(s)?\b",  # common false positive in news, allowlisted but still flagged for manual review
-    r"\bconcurso\b",  # common false positive in news (e.g. "concurso de beleza"), allowlisted but still flagged for manual review
-    r"\bconcursos\b",  # common false positive in news (e.g. "concursos públicos"), allowlisted but still flagged for manual review
     r"\bbaleado\b",
     r"\bferido\b",
     r"\btiro\b",
@@ -44,6 +42,10 @@ _ADULT_PATTERNS = [
     r"\bpartida\b",
     r"\blavagem de dinheiro\b",
     r"\blavagem\b",
+    r"\bb[ée]lico\b",
+    r"\barma(s)\b",
+    r"\barmamento\b",
+    r"\bmunição\b",
 ]
 
 # allowlist to reduce false positives for politics/news (e.g. "sexo" in demographics)
