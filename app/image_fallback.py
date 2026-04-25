@@ -49,6 +49,7 @@ async def _openverse_candidates(client: httpx.AsyncClient, query: str) -> list[d
             )
         return out
     except Exception as e:
+        print(f"Erro ao acessar Openverse: {q} - {str(e)}")
         log.debug("openverse_search_failed", extra={"q": q, "err": str(e)})
         return []
 
