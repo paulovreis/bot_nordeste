@@ -368,6 +368,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                 reply_markup=button,
                             )
                         except Exception:
+                            print(f"Erro ao enviar foto: {url} - {image_url}")
                             log.debug("send_photo_failed", extra={"news_id": news_id})
                             mid = None
 

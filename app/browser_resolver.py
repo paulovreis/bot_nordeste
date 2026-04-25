@@ -77,6 +77,7 @@ class BrowserResolver:
         today = datetime.date.today()
         self._exhausted[key] = today
         db.save_key_exhausted(self._conn, key, today)
+        print(f"Chave ScraperAPI esgotada: {key[-4:]}, marcada como esgotada em {today}")
         log.warning(
             "scraper_api_key_exhausted",
             extra={"key_suffix": key[-4:], "available_remaining": len(self._available_keys())},
@@ -124,6 +125,7 @@ class BrowserResolver:
                         if any(p in body_lower for p in _CREDIT_ERROR_PHRASES):
                             self._mark_exhausted(key)
                             continue
+                        print(f"Erro ao acessar ScraperAPI: {r.status_code} - {r.text}")
                         log.warning("scraper_api_target_403", extra={"url": url, "status": r.status_code})
                         return None
 
