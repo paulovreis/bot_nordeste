@@ -29,7 +29,7 @@ def default_queries() -> list[str]:
         "Piauí",
     ]
 
-    obras = "(\"obra pública\" OR \"grande obra\" OR ponte OR rodovia OR ferrovia OR metrô OR porto OR aeroporto OR saneamento OR hospital OR licitação OR PAC OR \"concurso público\")"
+    obras = "(\"obra pública\" OR \"grande obra\" OR ponte OR rodovia OR ferrovia OR metrô OR porto OR aeroporto OR saneamento OR hospital OR licitação OR PAC OR concurso OR \"concurso público\")"
     politica = "(política OR governador OR prefeitura OR \"assembleia legislativa\" OR eleição OR \"gestão pública\")"
 
     queries: list[str] = []
