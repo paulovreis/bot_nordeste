@@ -57,6 +57,20 @@ def _extract_source(entry) -> str:
     return "google-news"
 
 
+def _strip_source_suffix(title: str, source: str) -> str:
+    """Remove the ' - Source Name' suffix that Google News appends to RSS titles.
+
+    Handles edge cases like 'Title - - Source' (when the article title itself ends with ' -').
+    """
+    if not source or source == "google-news":
+        return title
+    suffix = f" - {source}"
+    if title.endswith(suffix):
+        # Strip suffix then clean up any trailing ' -' left behind
+        title = title[: -len(suffix)].rstrip(" -").strip()
+    return title
+
+
 def _extract_best_link(entry) -> str | None:
     # Prefer a non-news.google.com link when present.
     links = entry.get("links") or []
@@ -115,9 +129,11 @@ def fetch_items(
                 break
 
             link = _extract_best_link(entry)
-            title = (entry.get("title") or "").strip()
-            if not link or not title:
+            raw_title = (entry.get("title") or "").strip()
+            if not link or not raw_title:
                 continue
+            source = _extract_source(entry)
+            title = _strip_source_suffix(raw_title, source)
 
             # block non-news sources early (social media, maps, etc.)
             if is_blocked_source_url(link):
@@ -142,7 +158,6 @@ def fetch_items(
             canonical = canonicalize_url(link)
             if is_homepage_url(canonical) or is_blocked_source_url(canonical):
                 continue
-            source = _extract_source(entry)
             published_iso = published_utc.isoformat(timespec="seconds")
             news_id = make_news_id(canonical, source, published_iso)
 
