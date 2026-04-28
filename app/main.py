@@ -35,7 +35,7 @@ from .util import (
 log = logging.getLogger(__name__)
 
 _MAX_BROWSER_RETRIES = 1
-_CONCURSO_RE = re.compile(r"\bconcurso\b", re.IGNORECASE)
+_CONCURSO_RE = re.compile(r"\bconcurso(s)?\b", re.IGNORECASE)
 _CONCURSO_THROTTLE = 15  # send 1 concurso item per N other items
 
 
