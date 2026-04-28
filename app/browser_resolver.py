@@ -130,16 +130,18 @@ class BrowserResolver:
                         return None
 
                     if r.status_code != 200:
-                        print(f"Erro ao acessar ScraperAPI: {r.status_code} - {r.text}")
-                        log.warning("scraper_api_error", extra={"status": r.status_code})
+                        print(f"[ERRO] ScraperAPI {r.status_code} para url={target_url} | {r.text[:200]}")
+                        log.warning("scraper_api_error", extra={"status": r.status_code, "url": target_url})
                         return None
 
                     final_url, image_url = _extract_from_html(r.content)
+                    if not final_url:
+                        print(f"[WARN] ScraperAPI retornou 200 mas nao extraiu URL final para url={target_url}")
                     return ResolvedItem(final_url=final_url, image_url=image_url) if final_url else None
 
                 except Exception as exc:
-                    print(f"Erro ao acessar ScraperAPI: {exc}")
-                    log.warning("scraper_api_failed", extra={"err": str(exc)})
+                    print(f"[ERRO] ScraperAPI excecao para url={target_url} | {exc}")
+                    log.warning("scraper_api_failed", extra={"err": str(exc), "url": target_url})
                     return None
 
         return None

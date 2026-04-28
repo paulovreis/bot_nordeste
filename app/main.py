@@ -35,6 +35,7 @@ from .util import (
 log = logging.getLogger(__name__)
 
 _MAX_BROWSER_RETRIES = 1
+_MAX_PHOTO_RETRIES = 3
 _CONCURSO_RE = re.compile(r"\bconcurso(s)?\b", re.IGNORECASE)
 _CONCURSO_THROTTLE = 15  # send 1 concurso item per N other items
 
@@ -200,6 +201,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                 if "news.google.com" in url and not image_url:
                     # Limita retries para não queimar créditos em URLs que falham repetidamente
                     if q_attempts >= _MAX_BROWSER_RETRIES and "browser_resolve_failed" in q_last_error:
+                        print(f"[SKIP] news_id={news_id} url={url} tentativas={q_attempts} — max retries ScraperAPI atingido, pulando")
                         db.mark_skipped(conn, queue_id, "browser_resolve_max_retries")
                         continue
 
@@ -212,6 +214,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                         free_url = canonicalize_url(free_url_raw) if free_url_raw else None
 
                         if not free_url or is_homepage_url(free_url) or is_blocked_source_url(free_url):
+                            print(f"[RETRY] news_id={news_id} free_url invalida={free_url!r}")
                             db.mark_retry(conn, queue_id, f"bad_free_url:{free_url}", delay_sec=2 * 3600)
                             continue
 
@@ -237,6 +240,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                         # Fallback: ScraperAPI com renderização JS (1 crédito)
                         resolved = await resolver.resolve(url)
                         if resolved is None:
+                            print(f"[RETRY] news_id={news_id} url={url} tentativa={q_attempts + 1}/{_MAX_BROWSER_RETRIES} — ScraperAPI retornou None")
                             db.mark_retry(conn, queue_id, "browser_resolve_failed", delay_sec=4 * 3600)
                             await asyncio.sleep(3)
                             continue
@@ -318,6 +322,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                         image_url = fb
 
                 if settings.require_image and not image_url:
+                    print(f"[RETRY] news_id={news_id} url={url} — sem imagem, reagendando em 2h")
                     db.mark_retry(conn, queue_id, "no_image", delay_sec=2 * 3600)
                     continue
 
@@ -379,6 +384,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                     db.mark_sent(conn, queue_id, telegram_message_id=None)
                 else:
                     mid = None
+                    photo_fallback_to_text = False
                     if image_url:
                         try:
                             mid = await tg.send_photo(
@@ -387,9 +393,9 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                 caption=text,
                                 reply_markup=button,
                             )
-                        except Exception:
-                            print(f"Erro ao enviar foto: {url} - {image_url}")
-                            log.debug("send_photo_failed", extra={"news_id": news_id})
+                        except Exception as photo_exc:
+                            print(f"[ERRO] Foto falhou: news_id={news_id} url={url} img={image_url} | {photo_exc}")
+                            log.debug("send_photo_failed", extra={"news_id": news_id, "err": str(photo_exc)})
                             mid = None
 
                             # Tenta re-enrich apenas via httpx (nunca volta ao Playwright)
@@ -400,6 +406,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                     or not bool(og2.image_url)
                                 )
                                 if og2.image_url and og2.image_url != image_url:
+                                    print(f"[RE-ENRICH] news_id={news_id} nova imagem encontrada: {og2.image_url}")
                                     try:
                                         mid = await tg.send_photo(
                                             chat_id=settings.chat_id,
@@ -409,12 +416,15 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                         )
                                         db.set_enrichment(conn, news_id, image_url=og2.image_url, og_description=None)
                                         image_url = og2.image_url
-                                    except Exception:
+                                    except Exception as photo_exc2:
+                                        print(f"[ERRO] Foto alternativa falhou: news_id={news_id} img={og2.image_url} | {photo_exc2}")
                                         mid = None
-                            except Exception:
-                                pass
+                                else:
+                                    print(f"[RE-ENRICH] news_id={news_id} nenhuma imagem alternativa encontrada (og2.image_url={og2.image_url!r})")
+                            except Exception as enrich_exc:
+                                print(f"[ERRO] Re-enrich falhou: news_id={news_id} | {enrich_exc}")
 
-                            if settings.require_image and settings.image_fallback and allow_claude_fallback and not mid:
+                            if settings.image_fallback and allow_claude_fallback and not mid:
                                 alt = await get_fallback_image(
                                     client,
                                     title,
@@ -422,6 +432,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                     claude_model=settings.claude_model,
                                 )
                                 if alt and alt != image_url:
+                                    print(f"[FALLBACK] news_id={news_id} tentando imagem fallback: {alt}")
                                     try:
                                         mid = await tg.send_photo(
                                             chat_id=settings.chat_id,
@@ -431,24 +442,33 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                         )
                                         db.set_enrichment(conn, news_id, image_url=alt, og_description=None)
                                         image_url = alt
-                                    except Exception:
+                                    except Exception as photo_exc3:
+                                        print(f"[ERRO] Foto fallback falhou: news_id={news_id} img={alt} | {photo_exc3}")
                                         mid = None
 
-                            if settings.require_image and not mid:
-                                db.mark_retry(conn, queue_id, "send_photo_failed", delay_sec=30 * 60)
-                                continue
+                            if not mid:
+                                if settings.require_image and q_attempts < _MAX_PHOTO_RETRIES:
+                                    print(f"[RETRY] news_id={news_id} send_photo falhou, tentativa {q_attempts + 1}/{_MAX_PHOTO_RETRIES}")
+                                    db.mark_retry(conn, queue_id, "send_photo_failed", delay_sec=30 * 60)
+                                    continue
+                                if settings.require_image:
+                                    print(f"[WARN] news_id={news_id} foto falhou {q_attempts + 1} vezes — enviando sem foto")
+                                    photo_fallback_to_text = True
 
                     if not mid:
-                        if settings.require_image:
+                        if settings.require_image and not photo_fallback_to_text:
+                            print(f"[RETRY] news_id={news_id} sem imagem para enviar")
                             db.mark_retry(conn, queue_id, "no_image_to_send", delay_sec=30 * 60)
                             continue
 
+                        print(f"[TEXT] news_id={news_id} url={url} — enviando sem foto")
                         mid = await tg.send_message(
                             chat_id=settings.chat_id,
                             text=text,
                             reply_markup=button,
                             disable_web_page_preview=True,
                         )
+                    print(f"[SENT] news_id={news_id} mid={mid} url={url}")
                     db.mark_sent(conn, queue_id, telegram_message_id=mid)
 
                 if _is_concurso(title, snippet or ""):
