@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -34,6 +35,12 @@ from .util import (
 log = logging.getLogger(__name__)
 
 _MAX_BROWSER_RETRIES = 1
+_CONCURSO_RE = re.compile(r"\bconcurso\b", re.IGNORECASE)
+_CONCURSO_THROTTLE = 15  # send 1 concurso item per N other items
+
+
+def _is_concurso(title: str, snippet: str) -> bool:
+    return bool(_CONCURSO_RE.search(title) or _CONCURSO_RE.search(snippet or ""))
 
 
 async def collector_loop(conn, settings) -> None:
@@ -130,6 +137,8 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
             else None
         )
 
+        sent_since_last_concurso = 0
+
         while True:
             now_utc = datetime.now(timezone.utc)
 
@@ -149,6 +158,17 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
             news_id = row["news_id"]
             q_attempts = int(row["attempts"] or 0)
             q_last_error = row["last_error"] or ""
+
+            if _is_concurso(row["title"], row["snippet"] or ""):
+                if sent_since_last_concurso < _CONCURSO_THROTTLE:
+                    needed = _CONCURSO_THROTTLE - sent_since_last_concurso
+                    delay_sec = needed * int(settings.send_interval_min) * 60
+                    log.info(
+                        "concurso_throttled",
+                        extra={"queue_id": queue_id, "sent_since_last": sent_since_last_concurso, "delay_sec": delay_sec},
+                    )
+                    db.mark_retry(conn, queue_id, "concurso_throttle", delay_sec=delay_sec)
+                    continue
 
             now_utc = datetime.now(timezone.utc)
             if not window.is_open(now_utc):
@@ -431,6 +451,10 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                         )
                     db.mark_sent(conn, queue_id, telegram_message_id=mid)
 
+                if _is_concurso(title, snippet or ""):
+                    sent_since_last_concurso = 0
+                else:
+                    sent_since_last_concurso += 1
                 await asyncio.sleep(settings.send_interval_min * 60)
 
             except Exception as e:
