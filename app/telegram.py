@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import httpx
@@ -54,6 +55,31 @@ class TelegramClient:
         if reply_markup:
             payload["reply_markup"] = reply_markup
         r = await self._client.post(f"{self._base}/sendPhoto", json=payload)
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"telegram_error:{data}")
+        return str(data["result"]["message_id"]) if data.get("result") else None
+
+    async def send_photo_upload(
+        self,
+        *,
+        chat_id: str,
+        photo_bytes: bytes,
+        filename: str = "photo.jpg",
+        content_type: str = "image/jpeg",
+        caption: str,
+        reply_markup: dict | None = None,
+        parse_mode: str = "HTML",
+    ) -> str | None:
+        fields: list = [
+            ("chat_id", (None, chat_id)),
+            ("caption", (None, caption)),
+            ("parse_mode", (None, parse_mode)),
+            ("photo", (filename, photo_bytes, content_type)),
+        ]
+        if reply_markup:
+            fields.append(("reply_markup", (None, json.dumps(reply_markup))))
+        r = await self._client.post(f"{self._base}/sendPhoto", files=fields)
         data = r.json()
         if not data.get("ok"):
             raise RuntimeError(f"telegram_error:{data}")

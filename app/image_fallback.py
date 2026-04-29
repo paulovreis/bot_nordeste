@@ -19,7 +19,7 @@ async def _openverse_candidates(client: httpx.AsyncClient, query: str) -> list[d
         return []
     try:
         r = await client.get(
-            "https://api.openverse.engineering/v1/images",
+            "https://api.openverse.org/v1/images",
             params={
                 "q": q,
                 "page_size": 18,

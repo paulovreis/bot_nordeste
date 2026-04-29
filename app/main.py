@@ -35,6 +35,49 @@ from .util import (
 log = logging.getLogger(__name__)
 
 _MAX_BROWSER_RETRIES = 1
+_MAX_IMG_BYTES = 10 * 1024 * 1024  # Telegram photo upload limit
+
+
+async def _try_send_photo(
+    tg,
+    client: httpx.AsyncClient,
+    *,
+    chat_id: str,
+    image_url: str,
+    caption: str,
+    reply_markup: dict,
+    news_id: str,
+) -> str | None:
+    """Send photo by URL; if Telegram can't fetch it, download and upload directly."""
+    try:
+        return await tg.send_photo(
+            chat_id=chat_id,
+            photo_url=image_url,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+    except Exception as e:
+        log.debug("send_photo_url_failed", extra={"news_id": news_id, "err": str(e)})
+
+    try:
+        r = await client.get(image_url, follow_redirects=True)
+        ctype = (r.headers.get("content-type") or "").lower().split(";")[0].strip()
+        if r.status_code == 200 and "image" in ctype and len(r.content) <= _MAX_IMG_BYTES:
+            ext = "webp" if "webp" in ctype else "png" if "png" in ctype else "jpg"
+            mid = await tg.send_photo_upload(
+                chat_id=chat_id,
+                photo_bytes=r.content,
+                filename=f"photo.{ext}",
+                content_type=ctype,
+                caption=caption,
+                reply_markup=reply_markup,
+            )
+            print(f"[UPLOAD] news_id={news_id} imagem enviada via upload direto")
+            return mid
+    except Exception as e:
+        log.debug("send_photo_upload_failed", extra={"news_id": news_id, "err": str(e)})
+
+    return None
 _MAX_PHOTO_RETRIES = 3
 _CONCURSO_RE = re.compile(r"\bconcurso(s)?\b", re.IGNORECASE)
 _CONCURSO_THROTTLE = 15  # send 1 concurso item per N other items
@@ -384,19 +427,19 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                     db.mark_sent(conn, queue_id, telegram_message_id=None)
                 else:
                     mid = None
-                    photo_fallback_to_text = False
                     if image_url:
-                        try:
-                            mid = await tg.send_photo(
-                                chat_id=settings.chat_id,
-                                photo_url=image_url,
-                                caption=text,
-                                reply_markup=button,
-                            )
-                        except Exception as photo_exc:
-                            print(f"[ERRO] Foto falhou: news_id={news_id} url={url} img={image_url} | {photo_exc}")
-                            log.debug("send_photo_failed", extra={"news_id": news_id, "err": str(photo_exc)})
-                            mid = None
+                        mid = await _try_send_photo(
+                            tg, client,
+                            chat_id=settings.chat_id,
+                            image_url=image_url,
+                            caption=text,
+                            reply_markup=button,
+                            news_id=news_id,
+                        )
+
+                        if mid is None:
+                            print(f"[ERRO] Foto falhou: news_id={news_id} url={url} img={image_url}")
+                            log.debug("send_photo_failed", extra={"news_id": news_id})
 
                             # Tenta re-enrich apenas via httpx (nunca volta ao Playwright)
                             try:
@@ -407,18 +450,19 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                 )
                                 if og2.image_url and og2.image_url != image_url:
                                     print(f"[RE-ENRICH] news_id={news_id} nova imagem encontrada: {og2.image_url}")
-                                    try:
-                                        mid = await tg.send_photo(
-                                            chat_id=settings.chat_id,
-                                            photo_url=og2.image_url,
-                                            caption=text,
-                                            reply_markup=button,
-                                        )
+                                    mid = await _try_send_photo(
+                                        tg, client,
+                                        chat_id=settings.chat_id,
+                                        image_url=og2.image_url,
+                                        caption=text,
+                                        reply_markup=button,
+                                        news_id=news_id,
+                                    )
+                                    if mid:
                                         db.set_enrichment(conn, news_id, image_url=og2.image_url, og_description=None)
                                         image_url = og2.image_url
-                                    except Exception as photo_exc2:
-                                        print(f"[ERRO] Foto alternativa falhou: news_id={news_id} img={og2.image_url} | {photo_exc2}")
-                                        mid = None
+                                    else:
+                                        print(f"[ERRO] Foto alternativa falhou: news_id={news_id} img={og2.image_url}")
                                 else:
                                     print(f"[RE-ENRICH] news_id={news_id} nenhuma imagem alternativa encontrada (og2.image_url={og2.image_url!r})")
                             except Exception as enrich_exc:
@@ -433,18 +477,19 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                 )
                                 if alt and alt != image_url:
                                     print(f"[FALLBACK] news_id={news_id} tentando imagem fallback: {alt}")
-                                    try:
-                                        mid = await tg.send_photo(
-                                            chat_id=settings.chat_id,
-                                            photo_url=alt,
-                                            caption=text,
-                                            reply_markup=button,
-                                        )
+                                    mid = await _try_send_photo(
+                                        tg, client,
+                                        chat_id=settings.chat_id,
+                                        image_url=alt,
+                                        caption=text,
+                                        reply_markup=button,
+                                        news_id=news_id,
+                                    )
+                                    if mid:
                                         db.set_enrichment(conn, news_id, image_url=alt, og_description=None)
                                         image_url = alt
-                                    except Exception as photo_exc3:
-                                        print(f"[ERRO] Foto fallback falhou: news_id={news_id} img={alt} | {photo_exc3}")
-                                        mid = None
+                                    else:
+                                        print(f"[ERRO] Foto fallback falhou: news_id={news_id} img={alt}")
 
                             if not mid:
                                 if settings.require_image and q_attempts < _MAX_PHOTO_RETRIES:
@@ -452,13 +497,14 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                     db.mark_retry(conn, queue_id, "send_photo_failed", delay_sec=30 * 60)
                                     continue
                                 if settings.require_image:
-                                    print(f"[WARN] news_id={news_id} foto falhou {q_attempts + 1} vezes — enviando sem foto")
-                                    photo_fallback_to_text = True
+                                    print(f"[SKIP] news_id={news_id} foto falhou apos {q_attempts + 1} tentativas — pulando")
+                                    db.mark_skipped(conn, queue_id, "photo_failed_max_retries")
+                                    continue
 
                     if not mid:
-                        if settings.require_image and not photo_fallback_to_text:
-                            print(f"[RETRY] news_id={news_id} sem imagem para enviar")
-                            db.mark_retry(conn, queue_id, "no_image_to_send", delay_sec=30 * 60)
+                        if settings.require_image:
+                            print(f"[SKIP] news_id={news_id} sem imagem para enviar — pulando")
+                            db.mark_skipped(conn, queue_id, "no_image_to_send")
                             continue
 
                         print(f"[TEXT] news_id={news_id} url={url} — enviando sem foto")
