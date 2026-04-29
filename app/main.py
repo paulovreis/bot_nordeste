@@ -38,12 +38,16 @@ _MAX_BROWSER_RETRIES = 1
 _MAX_IMG_BYTES = 10 * 1024 * 1024  # Telegram photo upload limit
 
 
+_IMG_DOWNLOAD_TIMEOUT = httpx.Timeout(connect=8.0, read=15.0, write=5.0, pool=5.0)
+
+
 async def _try_send_photo(
     tg,
     client: httpx.AsyncClient,
     *,
     chat_id: str,
     image_url: str,
+    article_url: str = "",
     caption: str,
     reply_markup: dict,
     news_id: str,
@@ -60,7 +64,10 @@ async def _try_send_photo(
         log.debug("send_photo_url_failed", extra={"news_id": news_id, "err": str(e)})
 
     try:
-        r = await client.get(image_url, follow_redirects=True)
+        dl_headers = {"Referer": article_url} if article_url else {}
+        r = await client.get(
+            image_url, follow_redirects=True, headers=dl_headers, timeout=_IMG_DOWNLOAD_TIMEOUT
+        )
         ctype = (r.headers.get("content-type") or "").lower().split(";")[0].strip()
         if r.status_code == 200 and "image" in ctype and len(r.content) <= _MAX_IMG_BYTES:
             ext = "webp" if "webp" in ctype else "png" if "png" in ctype else "jpg"
@@ -74,6 +81,10 @@ async def _try_send_photo(
             )
             print(f"[UPLOAD] news_id={news_id} imagem enviada via upload direto")
             return mid
+        log.debug(
+            "send_photo_download_skipped",
+            extra={"news_id": news_id, "status": r.status_code, "ctype": ctype},
+        )
     except Exception as e:
         log.debug("send_photo_upload_failed", extra={"news_id": news_id, "err": str(e)})
 
@@ -432,6 +443,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                             tg, client,
                             chat_id=settings.chat_id,
                             image_url=image_url,
+                            article_url=url,
                             caption=text,
                             reply_markup=button,
                             news_id=news_id,
@@ -454,6 +466,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                         tg, client,
                                         chat_id=settings.chat_id,
                                         image_url=og2.image_url,
+                                        article_url=url,
                                         caption=text,
                                         reply_markup=button,
                                         news_id=news_id,
@@ -481,6 +494,7 @@ async def sender_loop(conn, settings, resolver: BrowserResolver) -> None:
                                         tg, client,
                                         chat_id=settings.chat_id,
                                         image_url=alt,
+                                        article_url=url,
                                         caption=text,
                                         reply_markup=button,
                                         news_id=news_id,

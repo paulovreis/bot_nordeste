@@ -26,10 +26,17 @@ async def _openverse_candidates(client: httpx.AsyncClient, query: str) -> list[d
                 "license_type": "all",
                 "mature": "false",
             },
-            headers={"Accept-Encoding": "gzip, deflate"},
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip, deflate",
+                "User-Agent": "bot-nordeste/1.0",
+            },
             follow_redirects=True,
+            timeout=httpx.Timeout(15.0),
         )
-        r.raise_for_status()
+        if r.status_code != 200:
+            log.debug("openverse_http_error", extra={"q": q, "status": r.status_code})
+            return []
         data = json.loads(r.content) or {}
         results = data.get("results") or []
         out: list[dict] = []
