@@ -18,6 +18,8 @@ def default_queries() -> list[str]:
     # Use Google News query syntax with OR to widen coverage.
     geos = [
         "Nordeste",
+        "Nordestino",
+        "Nordestina",
         "Bahia",
         "Pernambuco",
         "Ceará",
@@ -29,8 +31,8 @@ def default_queries() -> list[str]:
         "Piauí",
     ]
 
-    obras = "(\"obra pública\" OR \"grande obra\" OR ponte OR rodovia OR ferrovia OR metrô OR porto OR aeroporto OR saneamento OR hospital OR licitação OR PAC OR concurso OR \"concurso público\")"
-    politica = "(política OR governador OR prefeitura OR \"assembleia legislativa\" OR eleição OR \"gestão pública\")"
+    obras = "(\"obra pública\" OR \"grande obra\" OR ponte OR rodovia OR ferrovia OR metrô OR porto OR aeroporto OR saneamento OR hospital OR habitação OR habitações OR barragem OR açude OR solar OR eólica OR energia OR energética OR seca OR exportação OR exportações OR educação OR educacional OR desenvolvimento OR desigualdade OR emendas OR licitação OR PAC OR concurso OR \"concurso público\")"
+    politica = "(política OR governador OR prefeitura OR \"assembleia legislativa\" OR eleição OR \"gestão pública\" OR eleições OR lula OR pt OR )"
 
     queries: list[str] = []
     for geo in geos:
