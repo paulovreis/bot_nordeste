@@ -13,7 +13,8 @@ from .util import canonicalize_url, is_blocked_source_url, is_homepage_url, make
 log = logging.getLogger(__name__)
 
 
-_NORDESTE_STATES = {
+_NORDESTE_TERMS = {
+    # Estados e gentílicos
     "nordeste",
     "nordestino",
     "nordestina",
@@ -51,12 +52,99 @@ _NORDESTE_STATES = {
     "maceió",
     "aracaju",
     "teresina",
+    # Cidades importantes — Bahia
+    "camaçari",
+    "feira de santana",
+    "vitória da conquista",
+    "ilhéus",
+    "itabuna",
+    "juazeiro",
+    "barreiras",
+    "paulo afonso",
+    "porto seguro",
+    "teixeira de freitas",
+    # Cidades importantes — Pernambuco
+    "caruaru",
+    "petrolina",
+    "garanhuns",
+    "olinda",
+    "jaboatão dos guararapes",
+    "ipojuca",
+    "araripina",
+    "paulista",
+    # Cidades importantes — Ceará
+    "sobral",
+    "juazeiro do norte",
+    "caucaia",
+    "maracanaú",
+    "crato",
+    "iguatu",
+    "itapipoca",
+    # Cidades importantes — Maranhão
+    "imperatriz",
+    "timon",
+    "caxias",
+    "açailândia",
+    "balsas",
+    "bacabal",
+    # Cidades importantes — Paraíba
+    "campina grande",
+    "patos",
+    "sousa",
+    "guarabira",
+    "cabedelo",
+    # Cidades importantes — Rio Grande do Norte
+    "mossoró",
+    "parnamirim",
+    "caicó",
+    "assu",
+    "currais novos",
+    # Cidades importantes — Alagoas
+    "penedo",
+    "delmiro gouveia",
+    "união dos palmares",
+    "rio largo",
+    "marechal deodoro",
+    # Cidades importantes — Sergipe
+    "lagarto",
+    "itabaiana",
+    "estância",
+    "tobias barreto",
+    "nossa senhora do socorro",
+    # Cidades importantes — Piauí
+    "parnaíba",
+    "picos",
+    "floriano",
+    "campo maior",
+    "são raimundo nonato",
+    "piripiri",
+    # Regiões geográficas
+    "sertão",
+    "sertanejo",
+    "sertaneja",
+    "agreste",
+    "zona da mata",
+    "meio-norte",
+    "recôncavo",
+    "polígono das secas",
+    "semiárido",
+    "semi-árido",
+    # Hidrografia relevante
+    "rio são francisco",
+    "são francisco",
+    "rio parnaíba",
+    "codevasf",
+    # Instituições específicas do Nordeste
+    "sudene",
+    "banco do nordeste",
+    "bnb",
+    "dnocs",
 }
 
 
 def _is_nordeste_related(title: str, snippet: str) -> bool:
     text = (title + " " + snippet).lower()
-    return any(term in text for term in _NORDESTE_STATES)
+    return any(term in text for term in _NORDESTE_TERMS)
 
 
 def default_queries() -> list[str]:
