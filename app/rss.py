@@ -13,13 +13,57 @@ from .util import canonicalize_url, is_blocked_source_url, is_homepage_url, make
 log = logging.getLogger(__name__)
 
 
+_NORDESTE_STATES = {
+    "nordeste",
+    "nordestino",
+    "nordestina",
+    "bahia",
+    "baiano",
+    "baiana",
+    "pernambuco",
+    "pernambucano",
+    "pernambucana",
+    "ceará",
+    "cearense",
+    "maranhão",
+    "maranhense",
+    "paraíba",
+    "paraibano",
+    "paraibana",
+    "rio grande do norte",
+    "potiguar",
+    "alagoas",
+    "alagoano",
+    "alagoana",
+    "sergipe",
+    "sergipano",
+    "sergipana",
+    "piauí",
+    "piauiense",
+    # Capitais
+    "salvador",
+    "recife",
+    "fortaleza",
+    "são luís",
+    "são luis",
+    "joão pessoa",
+    "natal",
+    "maceió",
+    "aracaju",
+    "teresina",
+}
+
+
+def _is_nordeste_related(title: str, snippet: str) -> bool:
+    text = (title + " " + snippet).lower()
+    return any(term in text for term in _NORDESTE_STATES)
+
+
 def default_queries() -> list[str]:
     # Keep this list intentionally small for performance.
     # Use Google News query syntax with OR to widen coverage.
     geos = [
         "Nordeste",
-        "Nordestino",
-        "Nordestina",
         "Bahia",
         "Pernambuco",
         "Ceará",
@@ -31,8 +75,8 @@ def default_queries() -> list[str]:
         "Piauí",
     ]
 
-    obras = "(\"obra pública\" OR \"grande obra\" OR ponte OR rodovia OR ferrovia OR metrô OR porto OR aeroporto OR saneamento OR hospital OR habitação OR habitações OR barragem OR açude OR solar OR eólica OR energia OR energética OR seca OR exportação OR exportações OR educação OR educacional OR desenvolvimento OR desigualdade OR emendas OR licitação OR PAC OR concurso OR \"concurso público\")"
-    politica = "(política OR governador OR prefeitura OR \"assembleia legislativa\" OR eleição OR \"gestão pública\" OR eleições OR lula OR pt OR )"
+    obras = "(\"obra pública\" OR \"grande obra\" OR ponte OR rodovia OR ferrovia OR metrô OR porto OR aeroporto OR saneamento OR hospital OR barragem OR açude OR \"energia solar\" OR \"energia eólica\" OR seca OR licitação OR PAC OR \"concurso público\")"
+    politica = "(governador OR prefeitura OR \"assembleia legislativa\" OR eleição OR eleições OR \"gestão pública\")"
 
     queries: list[str] = []
     for geo in geos:
@@ -165,6 +209,9 @@ def fetch_items(
 
             snippet = entry.get("summary") or entry.get("description") or ""
             snippet = truncate(_strip_html(snippet), 240)
+
+            if not _is_nordeste_related(title, snippet):
+                continue
 
             yield NewsItem(
                 news_id=news_id,
